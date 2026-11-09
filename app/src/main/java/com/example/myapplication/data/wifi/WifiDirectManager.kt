@@ -58,7 +58,13 @@ class WifiDirectManager(private val context: Context) {
 
             override fun onFailure(reasonCode: Int) {
                 _isDiscovering.value = false
-                _error.value = "Discovery failed. Reason code: $reasonCode"
+                val reasonText = when (reasonCode) {
+                    WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct is not supported on this device."
+                    WifiP2pManager.BUSY -> "System is busy. Please try again."
+                    WifiP2pManager.ERROR -> "Internal Error. Please ensure Wi-Fi and Location (GPS) are turned ON."
+                    else -> "Discovery failed with code: $reasonCode"
+                }
+                _error.value = reasonText
             }
         })
     }

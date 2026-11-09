@@ -22,6 +22,7 @@ import com.example.myapplication.domain.model.PairingStatus
 @Composable
 fun SenderPairingScreen(
     onNavigateBack: () -> Unit,
+    onNavigateToTransfer: () -> Unit,
     viewModel: SenderPairingViewModel = viewModel()
 ) {
     val session by viewModel.session.collectAsState()
@@ -66,7 +67,7 @@ fun SenderPairingScreen(
                     color = MaterialTheme.colorScheme.primary
                 )
                 Spacer(modifier = Modifier.height(16.dp))
-                Button(onClick = { /* TODO: Move to Remote WebRTC Transfer Screen */ }) {
+                Button(onClick = onNavigateToTransfer) {
                     Text("Start Transfer")
                 }
                 return@Column

@@ -14,7 +14,7 @@ object SignalingClient {
     
     // For local emulator testing: "http://10.0.2.2:3000"
     // For physical device testing, use the IP of the machine running Node.js: "http://192.168.x.x:3000"
-    var serverUrl = "http://10.0.2.2:3000"
+    var serverUrl = "http://192.168.1.13:3000"
     
     private val _events = MutableStateFlow<SignalingEvent?>(null)
     val events: StateFlow<SignalingEvent?> = _events.asStateFlow()
@@ -27,6 +27,10 @@ object SignalingClient {
             socket?.on(Socket.EVENT_CONNECT) {
                 Log.d("SignalingClient", "Connected to signaling server")
                 _events.value = SignalingEvent.Connected
+            }
+            
+            socket?.on(Socket.EVENT_CONNECT_ERROR) { args ->
+                Log.e("SignalingClient", "Connection error: ${args[0]}")
             }
             
             socket?.on("join-request") { args ->

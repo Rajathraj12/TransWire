@@ -29,13 +29,17 @@ fun NavGraph(navController: NavHostController) {
             SendScreen(
                 onNavigateBack = { navController.popBackStack() },
                 onNavigateToSenderPairing = { navController.navigate(Screen.SenderPairing.route) },
-                onNavigateToNearby = { navController.navigate(Screen.NearbyDiscovery.route) }
+                onNavigateToNearby = { navController.navigate(Screen.NearbyDiscovery.createRoute(true)) }
             )
         }
         
         composable(Screen.SenderPairing.route) {
             com.example.myapplication.presentation.pairing.SenderPairingScreen(
-                onNavigateBack = { navController.popBackStack() }
+                onNavigateBack = { navController.popBackStack() },
+                onNavigateToTransfer = { 
+                    // Temporarily using dummy IP for Remote Transfer stub
+                    navController.navigate(Screen.Transfer.createRoute(true, "0.0.0.0", true))
+                }
             )
         }
         

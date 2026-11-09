@@ -1,0 +1,24 @@
+
+> transwire-backend@1.0.0 dev
+> ts-node-dev src/index.ts
+
+[INFO] 00:00:36 ts-node-dev ver. 2.0.0 (using ts-node ver. 10.9.2, typescript ver. 5.9.3)
+[Signaling Server] Listening on port 3000
+[Socket] Connected: KvMg7CQ7CuZPHTDrAAAA
+[Session] Created a500faf2-25af-4224-9c9f-bdfc830214ce (PIN: ***) by KvMg7CQ7CuZPHTDrAAAA
+[Socket] Connected: PYR3Qw5CLTFR0X6gAAAB
+[Socket] Disconnected: PYR3Qw5CLTFR0X6gAAAB
+[Socket] Disconnected: KvMg7CQ7CuZPHTDrAAAA
+[Socket] Connected: eQqPVVbEx7HtPULBAAAC
+[Socket] Connected: b95m1wcchDnKyE7kAAAD
+[Session] Created 7be76bb1-6c91-4938-81f7-96f72c2e61d8 (PIN: ***) by b95m1wcchDnKyE7kAAAD
+[Session] Join request for 7be76bb1-6c91-4938-81f7-96f72c2e61d8 by eQqPVVbEx7HtPULBAAAC
+[Session] Paired 7be76bb1-6c91-4938-81f7-96f72c2e61d8
+[Socket] Disconnected: b95m1wcchDnKyE7kAAAD
+[Socket] Disconnected: eQqPVVbEx7HtPULBAAAC
+[Socket] Connected: qFo9J9hcNVrW57j0AAAE
+[Socket] Disconnected: qFo9J9hcNVrW57j0AAAE
+[Socket] Connected: WzJ-EeUJoFY-5gx3AAAF
+[Socket] Disconnected: WzJ-EeUJoFY-5gx3AAAF
+[Socket] Connected: 8QY9OzNRwBgVWqmcAAAG
+[Socket] Disconnected: 8QY9OzNRwBgVWqmcAAAG

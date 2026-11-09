@@ -95,7 +95,7 @@ fun ReceiveScreen(
                             style = MaterialTheme.typography.titleLarge
                         )
                         Spacer(modifier = Modifier.height(32.dp))
-                        Button(onClick = { /* TODO: Move to Remote WebRTC Transfer Screen */ }) {
+                        Button(onClick = { /* Will connect WebRTC later */ }) {
                             Text("Start Transfer")
                         }
                     }
