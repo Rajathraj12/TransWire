@@ -27,6 +27,7 @@ fun SenderPairingScreen(
     val session by viewModel.session.collectAsState()
     val qrCodeBitmap by viewModel.qrCodeBitmap.collectAsState()
     val timeRemaining by viewModel.timeRemainingSeconds.collectAsState()
+    val joinRequestReceiverId by viewModel.joinRequestReceiverId.collectAsState()
 
     Scaffold(
         topBar = {
@@ -58,6 +59,19 @@ fun SenderPairingScreen(
                 return@Column
             }
 
+            if (session?.status == PairingStatus.PAIRED) {
+                Text(
+                    text = "Paired Successfully!",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                Button(onClick = { /* TODO: Move to Remote WebRTC Transfer Screen */ }) {
+                    Text("Start Transfer")
+                }
+                return@Column
+            }
+
             if (session?.status == PairingStatus.EXPIRED) {
                 Text(
                     text = "Session Expired",
@@ -69,6 +83,26 @@ fun SenderPairingScreen(
                     Icon(Icons.Default.Refresh, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("Generate New Code")
+                }
+                return@Column
+            }
+            
+            if (joinRequestReceiverId != null) {
+                Text(
+                    text = "Receiver wants to join",
+                    style = MaterialTheme.typography.headlineMedium
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    OutlinedButton(onClick = { viewModel.rejectRequest() }) {
+                        Text("Reject")
+                    }
+                    Button(onClick = { viewModel.approveRequest() }) {
+                        Text("Approve")
+                    }
                 }
                 return@Column
             }

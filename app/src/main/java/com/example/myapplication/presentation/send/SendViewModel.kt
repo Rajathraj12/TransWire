@@ -6,6 +6,7 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.myapplication.domain.model.SelectedFile
+import com.example.myapplication.domain.repository.FileSelectionRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -46,14 +47,17 @@ class SendViewModel(application: Application) : AndroidViewModel(application) {
             }
             
             _selectedFiles.value = (_selectedFiles.value + newFiles).distinctBy { it.uri }
+            FileSelectionRepository.selectedFiles = _selectedFiles.value
         }
     }
     
     fun removeFile(file: SelectedFile) {
         _selectedFiles.value = _selectedFiles.value.filter { it.uri != file.uri }
+        FileSelectionRepository.selectedFiles = _selectedFiles.value
     }
     
     fun clearFiles() {
         _selectedFiles.value = emptyList()
+        FileSelectionRepository.clear()
     }
 }

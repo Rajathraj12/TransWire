@@ -27,6 +27,7 @@ import com.example.myapplication.domain.model.SelectedFile
 fun SendScreen(
     onNavigateBack: () -> Unit,
     onNavigateToSenderPairing: () -> Unit,
+    onNavigateToNearby: () -> Unit,
     viewModel: SendViewModel = viewModel()
 ) {
     val selectedFiles by viewModel.selectedFiles.collectAsState()
@@ -62,6 +63,36 @@ fun SendScreen(
                 icon = { Icon(Icons.Default.Add, contentDescription = "Add Files") },
                 text = { Text("Select Files") }
             )
+        },
+        bottomBar = {
+            if (selectedFiles.isNotEmpty()) {
+                Surface(
+                    color = MaterialTheme.colorScheme.background,
+                    shadowElevation = 8.dp
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp)
+                            .navigationBarsPadding(),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = onNavigateToNearby,
+                            modifier = Modifier.weight(1f).height(56.dp)
+                        ) {
+                            Text("Nearby")
+                        }
+                        
+                        Button(
+                            onClick = onNavigateToSenderPairing,
+                            modifier = Modifier.weight(1f).height(56.dp)
+                        ) {
+                            Text("Remote")
+                        }
+                    }
+                }
+            }
         }
     ) { paddingValues ->
         Column(
@@ -109,34 +140,13 @@ fun SendScreen(
                 
                 LazyColumn(
                     modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(bottom = 80.dp) // Space for FAB
+                    contentPadding = PaddingValues(bottom = 88.dp) // Space for FAB
                 ) {
                     items(selectedFiles, key = { it.uri }) { file ->
                         SelectedFileItem(
                             file = file,
                             onRemove = { viewModel.removeFile(file) }
                         )
-                    }
-                }
-                
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = { /* TODO: Nearby Transfer */ },
-                        modifier = Modifier.weight(1f).height(56.dp)
-                    ) {
-                        Text("Nearby")
-                    }
-                    
-                    Button(
-                        onClick = onNavigateToSenderPairing,
-                        modifier = Modifier.weight(1f).height(56.dp)
-                    ) {
-                        Text("Remote Transfer")
                     }
                 }
             }

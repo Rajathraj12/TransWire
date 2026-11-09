@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -25,6 +26,7 @@ import com.example.myapplication.util.CameraPreview
 @Composable
 fun ReceiveScreen(
     onNavigateBack: () -> Unit,
+    onNavigateToNearby: () -> Unit,
     viewModel: ReceiverPairingViewModel = viewModel()
 ) {
     val scanState by viewModel.scanState.collectAsState()
@@ -75,6 +77,29 @@ fun ReceiveScreen(
                 .padding(paddingValues)
         ) {
             when (val state = scanState) {
+                is ReceiverState.Paired -> {
+                    Column(
+                        modifier = Modifier.fillMaxSize().padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CheckCircle,
+                            contentDescription = "Success",
+                            modifier = Modifier.size(64.dp),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Text(
+                            text = "Paired Successfully!",
+                            style = MaterialTheme.typography.titleLarge
+                        )
+                        Spacer(modifier = Modifier.height(32.dp))
+                        Button(onClick = { /* TODO: Move to Remote WebRTC Transfer Screen */ }) {
+                            Text("Start Transfer")
+                        }
+                    }
+                }
                 is ReceiverState.WaitingForSenderApproval -> {
                     Column(
                         modifier = Modifier.fillMaxSize().padding(16.dp),
@@ -191,6 +216,17 @@ fun ReceiveScreen(
                                     ) {
                                         Text("Join")
                                     }
+                                }
+                                
+                                Spacer(modifier = Modifier.height(24.dp))
+                                Divider()
+                                Spacer(modifier = Modifier.height(16.dp))
+                                
+                                OutlinedButton(
+                                    onClick = onNavigateToNearby,
+                                    modifier = Modifier.fillMaxWidth().height(56.dp)
+                                ) {
+                                    Text("Nearby Transfer (Wi-Fi Direct)")
                                 }
                             }
                         }

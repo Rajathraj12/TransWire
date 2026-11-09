@@ -7,4 +7,10 @@ sealed class Screen(val route: String) {
     object History : Screen("history")
     object Settings : Screen("settings")
     object SenderPairing : Screen("sender_pairing")
+    object NearbyDiscovery : Screen("nearby_discovery/{isSender}") {
+        fun createRoute(isSender: Boolean) = "nearby_discovery/$isSender"
+    }
+    object Transfer : Screen("transfer/{isSender}/{hostIp}/{isGroupOwner}") {
+        fun createRoute(isSender: Boolean, hostIp: String, isGroupOwner: Boolean) = "transfer/$isSender/$hostIp/$isGroupOwner"
+    }
 }

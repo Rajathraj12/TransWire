@@ -3,6 +3,8 @@ package com.example.myapplication.presentation.pairing
 import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.myapplication.data.remote.SignalingClient
+import com.example.myapplication.data.remote.SignalingEvent
 import com.example.myapplication.domain.model.PairingSession
 import com.example.myapplication.domain.model.PairingStatus
 import com.example.myapplication.util.PairingUtils
@@ -23,15 +25,35 @@ class SenderPairingViewModel : ViewModel() {
 
     private val _timeRemainingSeconds = MutableStateFlow(0L)
     val timeRemainingSeconds: StateFlow<Long> = _timeRemainingSeconds.asStateFlow()
+    
+    private val _joinRequestReceiverId = MutableStateFlow<String?>(null)
+    val joinRequestReceiverId: StateFlow<String?> = _joinRequestReceiverId.asStateFlow()
 
     private var countdownJob: Job? = null
 
     init {
+        SignalingClient.connect()
+        
+        viewModelScope.launch {
+            SignalingClient.events.collect { event ->
+                when (event) {
+                    is SignalingEvent.JoinRequest -> {
+                        _joinRequestReceiverId.value = event.receiverId
+                    }
+                    is SignalingEvent.PeerJoined -> {
+                        _session.value = _session.value?.copy(status = PairingStatus.PAIRED)
+                    }
+                    else -> {}
+                }
+            }
+        }
+        
         generateNewSession()
     }
 
     fun generateNewSession() {
         countdownJob?.cancel()
+        _joinRequestReceiverId.value = null
         
         val sessionId = PairingUtils.generateSessionId()
         val pairingToken = PairingUtils.generatePairingToken()
@@ -54,22 +76,44 @@ class SenderPairingViewModel : ViewModel() {
             _qrCodeBitmap.value = QRCodeGenerator.generateQrCode(qrContent)
         }
 
+        SignalingClient.createSession(sessionId, pairingToken, pin)
+
         startCountdown()
+    }
+    
+    fun approveRequest() {
+        val receiverId = _joinRequestReceiverId.value
+        val sessionId = _session.value?.sessionId
+        if (receiverId != null && sessionId != null) {
+            SignalingClient.approvePeer(sessionId, receiverId)
+            _joinRequestReceiverId.value = null
+        }
+    }
+    
+    fun rejectRequest() {
+        val receiverId = _joinRequestReceiverId.value
+        val sessionId = _session.value?.sessionId
+        if (receiverId != null && sessionId != null) {
+            SignalingClient.rejectPeer(sessionId, receiverId)
+            _joinRequestReceiverId.value = null
+        }
     }
 
     private fun startCountdown() {
         countdownJob = viewModelScope.launch {
-            while (_timeRemainingSeconds.value > 0) {
+            while (_timeRemainingSeconds.value > 0 && _session.value?.status != PairingStatus.PAIRED) {
                 delay(1000)
                 _timeRemainingSeconds.value -= 1
             }
-            // Session expired
-            _session.value = _session.value?.copy(status = PairingStatus.EXPIRED)
+            if (_session.value?.status != PairingStatus.PAIRED) {
+                _session.value = _session.value?.copy(status = PairingStatus.EXPIRED)
+            }
         }
     }
     
     override fun onCleared() {
         super.onCleared()
         countdownJob?.cancel()
+        SignalingClient.disconnect()
     }
 }

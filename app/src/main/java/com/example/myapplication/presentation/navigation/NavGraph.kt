@@ -28,7 +28,8 @@ fun NavGraph(navController: NavHostController) {
         composable(Screen.Send.route) {
             SendScreen(
                 onNavigateBack = { navController.popBackStack() },
-                onNavigateToSenderPairing = { navController.navigate(Screen.SenderPairing.route) }
+                onNavigateToSenderPairing = { navController.navigate(Screen.SenderPairing.route) },
+                onNavigateToNearby = { navController.navigate(Screen.NearbyDiscovery.route) }
             )
         }
         
@@ -40,7 +41,8 @@ fun NavGraph(navController: NavHostController) {
         
         composable(Screen.Receive.route) {
             ReceiveScreen(
-                onNavigateBack = { navController.popBackStack() }
+                onNavigateBack = { navController.popBackStack() },
+                onNavigateToNearby = { navController.navigate(Screen.NearbyDiscovery.createRoute(false)) }
             )
         }
         
@@ -52,6 +54,45 @@ fun NavGraph(navController: NavHostController) {
         
         composable(Screen.Settings.route) {
             SettingsScreen(
+                onNavigateBack = { navController.popBackStack() }
+            )
+        }
+        
+        composable(
+            route = Screen.NearbyDiscovery.route,
+            arguments = listOf(androidx.navigation.navArgument("isSender") { type = androidx.navigation.NavType.BoolType })
+        ) { backStackEntry ->
+            val isSender = backStackEntry.arguments?.getBoolean("isSender") ?: false
+            com.example.myapplication.presentation.nearby.NearbyDiscoveryScreen(
+                isSender = isSender,
+                onNavigateToTransfer = { hostIp, isGroupOwner ->
+                    navController.navigate(Screen.Transfer.createRoute(isSender, hostIp, isGroupOwner))
+                },
+                onNavigateBack = { navController.popBackStack() }
+            )
+        }
+        
+        composable(
+            route = Screen.Transfer.route,
+            arguments = listOf(
+                androidx.navigation.navArgument("isSender") { type = androidx.navigation.NavType.BoolType },
+                androidx.navigation.navArgument("hostIp") { type = androidx.navigation.NavType.StringType },
+                androidx.navigation.navArgument("isGroupOwner") { type = androidx.navigation.NavType.BoolType }
+            )
+        ) { backStackEntry ->
+            val isSender = backStackEntry.arguments?.getBoolean("isSender") ?: false
+            val hostIp = backStackEntry.arguments?.getString("hostIp") ?: ""
+            val isGroupOwner = backStackEntry.arguments?.getBoolean("isGroupOwner") ?: false
+            
+            com.example.myapplication.presentation.transfer.TransferScreen(
+                isSender = isSender,
+                hostIp = hostIp,
+                isGroupOwner = isGroupOwner,
+                onNavigateHome = { 
+                    navController.navigate(Screen.Home.route) {
+                        popUpTo(Screen.Home.route) { inclusive = true }
+                    }
+                },
                 onNavigateBack = { navController.popBackStack() }
             )
         }
