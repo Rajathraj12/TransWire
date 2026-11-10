@@ -370,8 +370,14 @@ private fun QrPinPassTicket(
                 )
                 Spacer(Modifier.height(10.dp))
 
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    pin.forEachIndexed { index, ch ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .widthIn(max = 312.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    pin.padEnd(6, '-').take(6).forEachIndexed { index, ch ->
                         if (index == 3) {
                             Box(
                                 modifier = Modifier
@@ -384,7 +390,8 @@ private fun QrPinPassTicket(
                         }
                         Box(
                             modifier = Modifier
-                                .size(width = 40.dp, height = 48.dp)
+                                .weight(1f)
+                                .height(48.dp)
                                 .clip(ShapeSmall)
                                 .background(MaterialTheme.colorScheme.primaryContainer)
                                 .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f), ShapeSmall),
@@ -392,8 +399,9 @@ private fun QrPinPassTicket(
                         ) {
                             Text(
                                 text = ch.toString(),
-                                style = MonoLarge.copy(fontSize = 22.sp),
-                                color = MaterialTheme.colorScheme.primary
+                                style = MonoLarge.copy(fontSize = 20.sp),
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1
                             )
                         }
                     }

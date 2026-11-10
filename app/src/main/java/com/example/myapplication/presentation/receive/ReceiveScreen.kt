@@ -405,86 +405,91 @@ private fun QrScanViewport(
                 .background(Color.Black.copy(alpha = 0.30f))
         )
 
-        // Custom Canvas Corner Reticle + Sweep Line
-        Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.Center
-        ) {
-            Canvas(modifier = Modifier.size(240.dp)) {
-                val cornerLen = 30.dp.toPx()
-                val strokeW = 3.5.dp.toPx()
-                val w = size.width
-                val h = size.height
-                val cornerColor = Color.White
-
-                // Top-left
-                drawLine(cornerColor, Offset(0f, 0f), Offset(cornerLen, 0f), strokeW, StrokeCap.Round)
-                drawLine(cornerColor, Offset(0f, 0f), Offset(0f, cornerLen), strokeW, StrokeCap.Round)
-                // Top-right
-                drawLine(cornerColor, Offset(w, 0f), Offset(w - cornerLen, 0f), strokeW, StrokeCap.Round)
-                drawLine(cornerColor, Offset(w, 0f), Offset(w, cornerLen), strokeW, StrokeCap.Round)
-                // Bottom-left
-                drawLine(cornerColor, Offset(0f, h), Offset(cornerLen, h), strokeW, StrokeCap.Round)
-                drawLine(cornerColor, Offset(0f, h), Offset(0f, h - cornerLen), strokeW, StrokeCap.Round)
-                // Bottom-right
-                drawLine(cornerColor, Offset(w, h), Offset(w - cornerLen, h), strokeW, StrokeCap.Round)
-                drawLine(cornerColor, Offset(w, h), Offset(w, h - cornerLen), strokeW, StrokeCap.Round)
-
-                // Sweeping beam inside frame
-                val lineY = h * scanYFraction
-                drawLine(
-                    color = primaryColor,
-                    start = Offset(12.dp.toPx(), lineY),
-                    end = Offset(w - 12.dp.toPx(), lineY),
-                    strokeWidth = 2.dp.toPx(),
-                    cap = StrokeCap.Round
-                )
-            }
-        }
-
-        // Bottom instructions + quick switches
-        Surface(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .padding(TwSpacing.Default)
-                .navigationBarsPadding(),
-            shape = ShapeLarge,
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
-            shadowElevation = 6.dp
-        ) {
-            Column(
-                modifier = Modifier.padding(TwSpacing.Default),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Custom Canvas Corner Reticle + Sweep Line centered in the clear area above bottom card
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(TwSpacing.Default),
+                contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = "Point camera at QR code or upload an image",
-                    style = MaterialTheme.typography.titleSmall,
-                    textAlign = TextAlign.Center
-                )
-                TwPrimaryButton(
-                    text = "Upload QR Image",
-                    onClick = onUploadQrImage,
-                    modifier = Modifier.fillMaxWidth(),
-                    leadingIcon = Icons.Default.AddPhotoAlternate
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                Canvas(modifier = Modifier.size(216.dp)) {
+                    val cornerLen = 28.dp.toPx()
+                    val strokeW = 3.5.dp.toPx()
+                    val w = size.width
+                    val h = size.height
+                    val cornerColor = Color.White
+
+                    // Top-left
+                    drawLine(cornerColor, Offset(0f, 0f), Offset(cornerLen, 0f), strokeW, StrokeCap.Round)
+                    drawLine(cornerColor, Offset(0f, 0f), Offset(0f, cornerLen), strokeW, StrokeCap.Round)
+                    // Top-right
+                    drawLine(cornerColor, Offset(w, 0f), Offset(w - cornerLen, 0f), strokeW, StrokeCap.Round)
+                    drawLine(cornerColor, Offset(w, 0f), Offset(w, cornerLen), strokeW, StrokeCap.Round)
+                    // Bottom-left
+                    drawLine(cornerColor, Offset(0f, h), Offset(cornerLen, h), strokeW, StrokeCap.Round)
+                    drawLine(cornerColor, Offset(0f, h), Offset(0f, h - cornerLen), strokeW, StrokeCap.Round)
+                    // Bottom-right
+                    drawLine(cornerColor, Offset(w, h), Offset(w - cornerLen, h), strokeW, StrokeCap.Round)
+                    drawLine(cornerColor, Offset(w, h), Offset(w, h - cornerLen), strokeW, StrokeCap.Round)
+
+                    // Sweeping beam inside frame
+                    val lineY = h * scanYFraction
+                    drawLine(
+                        color = primaryColor,
+                        start = Offset(12.dp.toPx(), lineY),
+                        end = Offset(w - 12.dp.toPx(), lineY),
+                        strokeWidth = 2.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                }
+            }
+
+            // Bottom instructions + quick switches
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = TwSpacing.Default)
+                    .padding(bottom = TwSpacing.Default)
+                    .navigationBarsPadding(),
+                shape = ShapeLarge,
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+                shadowElevation = 6.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(TwSpacing.Default),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    TwOutlinedButton(
-                        text = "Use PIN",
-                        onClick = onSwitchToPin,
-                        modifier = Modifier.weight(1f),
-                        leadingIcon = Icons.Default.Dialpad
+                    Text(
+                        text = "Point camera at QR code or upload an image",
+                        style = MaterialTheme.typography.titleSmall,
+                        textAlign = TextAlign.Center
                     )
-                    TwSecondaryButton(
-                        text = "Nearby",
-                        onClick = onSwitchToNearby,
-                        modifier = Modifier.weight(1f),
-                        leadingIcon = Icons.Default.WifiTethering
+                    TwPrimaryButton(
+                        text = "Upload QR Image",
+                        onClick = onUploadQrImage,
+                        modifier = Modifier.fillMaxWidth(),
+                        leadingIcon = Icons.Default.AddPhotoAlternate
                     )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        TwOutlinedButton(
+                            text = "Use PIN",
+                            onClick = onSwitchToPin,
+                            modifier = Modifier.weight(1f),
+                            leadingIcon = Icons.Default.Dialpad
+                        )
+                        TwSecondaryButton(
+                            text = "Nearby",
+                            onClick = onSwitchToNearby,
+                            modifier = Modifier.weight(1f),
+                            leadingIcon = Icons.Default.WifiTethering
+                        )
+                    }
                 }
             }
         }
@@ -596,13 +601,17 @@ private fun PinEntryPane(
             decorationBox = {
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null
-                    ) {
-                        focusRequester.requestFocus()
-                        keyboardController?.show()
-                    }
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .widthIn(max = 328.dp)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            focusRequester.requestFocus()
+                            keyboardController?.show()
+                        }
                 ) {
                     repeat(6) { index ->
                         val digit = pinInput.getOrNull(index)?.toString() ?: ""
@@ -610,7 +619,8 @@ private fun PinEntryPane(
                         val isFilled = digit.isNotEmpty()
                         Box(
                             modifier = Modifier
-                                .size(width = 46.dp, height = 56.dp)
+                                .weight(1f)
+                                .height(54.dp)
                                 .clip(ShapeSmall)
                                 .background(
                                     when {
