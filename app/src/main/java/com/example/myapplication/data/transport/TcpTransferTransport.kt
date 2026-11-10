@@ -1,10 +1,14 @@
 package com.example.myapplication.data.transport
 
-import com.example.myapplication.domain.model.FileManifest
 import com.example.myapplication.domain.model.TransferMessage
 import com.example.myapplication.domain.transport.TransferTransport
+import com.example.myapplication.util.MessageSerializer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -13,127 +17,106 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 
 class TcpTransferTransport : TransferTransport {
     private var socket: Socket? = null
     private var serverSocket: ServerSocket? = null
     private var dataIn: DataInputStream? = null
     private var dataOut: DataOutputStream? = null
+    private val writeMutex = Mutex()
+    @Volatile
+    private var disconnected = false
+
+    companion object {
+        private const val ACCEPT_TIMEOUT_MS = 45_000
+        private const val CONNECT_ATTEMPT_TIMEOUT_MS = 3_000
+        private const val SOCKET_READ_TIMEOUT_MS = 30_000
+        private const val MAX_CONNECT_ATTEMPTS = 20
+    }
 
     override suspend fun initAsServer(port: Int) = withContext(Dispatchers.IO) {
-        serverSocket = ServerSocket(port)
-        socket = serverSocket!!.accept()
-        setupStreams()
+        disconnected = false
+        val srv = ServerSocket(port).apply {
+            reuseAddress = true
+            soTimeout = ACCEPT_TIMEOUT_MS
+        }
+        serverSocket = srv
+        try {
+            val accepted = srv.accept()
+            socket = accepted
+            setupStreams(accepted)
+        } catch (e: SocketTimeoutException) {
+            throw SocketTimeoutException("Timed out waiting for peer to connect over TCP")
+        }
     }
 
     override suspend fun initAsClient(host: String, port: Int) = withContext(Dispatchers.IO) {
-        socket = Socket()
-        var connected = false
+        disconnected = false
+        var lastError: Exception? = null
+        var connectedSocket: Socket? = null
         var attempts = 0
-        while (!connected && attempts < 10) {
+        while (connectedSocket == null && attempts < MAX_CONNECT_ATTEMPTS && !disconnected) {
+            coroutineContext.ensureActive()
+            val candidate = Socket()
             try {
-                socket!!.connect(InetSocketAddress(host, port), 5000)
-                connected = true
+                candidate.connect(InetSocketAddress(host, port), CONNECT_ATTEMPT_TIMEOUT_MS)
+                connectedSocket = candidate
+            } catch (e: CancellationException) {
+                try { candidate.close() } catch (_: Exception) {}
+                throw e
             } catch (e: Exception) {
+                try { candidate.close() } catch (_: Exception) {}
+                lastError = e
                 attempts++
-                delay(1000) // Wait before retry
-            }
-        }
-        if (!connected) throw IOException("Failed to connect to TCP server")
-        setupStreams()
-    }
-
-    private fun setupStreams() {
-        socket?.let {
-            it.receiveBufferSize = 256 * 1024
-            it.sendBufferSize = 256 * 1024
-            dataIn = DataInputStream(it.getInputStream())
-            dataOut = DataOutputStream(it.getOutputStream())
-        }
-    }
-
-    override suspend fun writeMessage(message: TransferMessage) = withContext(Dispatchers.IO) {
-        val out = dataOut ?: throw IOException("Not connected")
-        when (message) {
-            is TransferMessage.Manifest -> {
-                out.writeInt(1) // type
-                out.writeInt(message.version)
-                out.writeInt(message.files.size)
-                message.files.forEach {
-                    out.writeUTF(it.fileId)
-                    out.writeUTF(it.name)
-                    out.writeLong(it.size)
-                    out.writeUTF(it.mimeType)
+                if (attempts < MAX_CONNECT_ATTEMPTS && !disconnected) {
+                    delay(1_000)
                 }
             }
-            is TransferMessage.Chunk -> {
-                out.writeInt(2) // type
-                out.writeUTF(message.fileId)
-                out.writeInt(message.chunkIndex)
-                out.writeInt(message.length)
-                out.write(message.payload, 0, message.length)
-            }
-            is TransferMessage.Completion -> {
-                out.writeInt(3) // type
-                out.writeUTF(message.fileId)
-                out.writeUTF(message.sha256)
-            }
-            is TransferMessage.Error -> {
-                out.writeInt(4) // type
-                out.writeUTF(message.message)
-            }
         }
-        out.flush()
+        val activeSocket = connectedSocket
+            ?: throw IOException(
+                "Failed to connect to TCP server after $attempts attempts: ${lastError?.message ?: "unreachable"}"
+            )
+        socket = activeSocket
+        setupStreams(activeSocket)
+    }
+
+    private fun setupStreams(activeSocket: Socket) {
+        activeSocket.soTimeout = SOCKET_READ_TIMEOUT_MS
+        activeSocket.tcpNoDelay = true
+        activeSocket.receiveBufferSize = 256 * 1024
+        activeSocket.sendBufferSize = 256 * 1024
+        dataIn = DataInputStream(activeSocket.getInputStream())
+        dataOut = DataOutputStream(activeSocket.getOutputStream())
+    }
+
+    override suspend fun writeMessage(message: TransferMessage) = writeMutex.withLock {
+        withContext(Dispatchers.IO) {
+            val out = dataOut ?: throw IOException("Not connected")
+            MessageSerializer.writeMessage(out, message)
+            out.flush()
+        }
     }
 
     override suspend fun readMessage(): TransferMessage = withContext(Dispatchers.IO) {
         val input = dataIn ?: throw IOException("Not connected")
         try {
-            val type = input.readInt()
-            when (type) {
-                1 -> {
-                    val version = input.readInt()
-                    val count = input.readInt()
-                    val files = mutableListOf<FileManifest>()
-                    for (i in 0 until count) {
-                        files.add(
-                            FileManifest(
-                                fileId = input.readUTF(),
-                                name = input.readUTF(),
-                                size = input.readLong(),
-                                mimeType = input.readUTF()
-                            )
-                        )
-                    }
-                    TransferMessage.Manifest(version, files)
-                }
-                2 -> {
-                    val fileId = input.readUTF()
-                    val chunkIndex = input.readInt()
-                    val length = input.readInt()
-                    val payload = ByteArray(length)
-                    input.readFully(payload)
-                    TransferMessage.Chunk(fileId, chunkIndex, length, payload)
-                }
-                3 -> {
-                    val fileId = input.readUTF()
-                    val sha256 = input.readUTF()
-                    TransferMessage.Completion(fileId, sha256)
-                }
-                4 -> {
-                    TransferMessage.Error(input.readUTF())
-                }
-                else -> throw IOException("Unknown message type: $type")
-            }
+            MessageSerializer.readMessage(input)
         } catch (e: EOFException) {
-            throw IOException("Connection closed by peer")
+            throw IOException("Connection closed by peer", e)
         }
     }
 
     override fun disconnect() {
+        disconnected = true
         try { dataIn?.close() } catch (_: Exception) {}
         try { dataOut?.close() } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
+        dataIn = null
+        dataOut = null
+        socket = null
+        serverSocket = null
     }
 }

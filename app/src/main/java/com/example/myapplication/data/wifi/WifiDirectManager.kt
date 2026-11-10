@@ -11,6 +11,7 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
+import android.os.Handler
 import android.os.Looper
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -32,6 +33,9 @@ class WifiDirectManager(private val context: Context) {
     private val _isDiscovering = MutableStateFlow(false)
     val isDiscovering: StateFlow<Boolean> = _isDiscovering.asStateFlow()
 
+    private val _thisDeviceName = MutableStateFlow<String?>(null)
+    val thisDeviceName: StateFlow<String?> = _thisDeviceName.asStateFlow()
+
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
@@ -40,9 +44,12 @@ class WifiDirectManager(private val context: Context) {
         addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
         addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
         addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
+        addAction(WifiP2pManager.WIFI_P2P_DISCOVERY_CHANGED_ACTION)
     }
 
-    fun startDiscovery() {
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    fun startDiscovery(retryOnBusy: Boolean = true) {
         _error.value = null
         if (manager == null || channel == null) {
             _error.value = "Wi-Fi Direct is not supported on this device."
@@ -50,6 +57,13 @@ class WifiDirectManager(private val context: Context) {
         }
 
         registerReceiver()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            manager.requestDeviceInfo(channel) { device ->
+                if (!device?.deviceName.isNullOrBlank()) {
+                    _thisDeviceName.value = device?.deviceName
+                }
+            }
+        }
 
         manager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
@@ -58,11 +72,19 @@ class WifiDirectManager(private val context: Context) {
 
             override fun onFailure(reasonCode: Int) {
                 _isDiscovering.value = false
+                if (reasonCode == WifiP2pManager.BUSY && retryOnBusy) {
+                    mainHandler.postDelayed({
+                        if (receiver != null) {
+                            startDiscovery(retryOnBusy = false)
+                        }
+                    }, 1200L)
+                    return
+                }
                 val reasonText = when (reasonCode) {
                     WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct is not supported on this device."
-                    WifiP2pManager.BUSY -> "System is busy. Please try again."
-                    WifiP2pManager.ERROR -> "Internal Error. Please ensure Wi-Fi and Location (GPS) are turned ON."
-                    else -> "Discovery failed with code: $reasonCode"
+                    WifiP2pManager.BUSY -> "Wi-Fi Direct is busy. Please try again in a moment."
+                    WifiP2pManager.ERROR -> "Unable to start Wi-Fi Direct. Ensure Wi-Fi and Location are turned ON."
+                    else -> "Wi-Fi Direct failed with code: $reasonCode"
                 }
                 _error.value = reasonText
             }
@@ -70,6 +92,7 @@ class WifiDirectManager(private val context: Context) {
     }
 
     fun stopDiscovery() {
+        mainHandler.removeCallbacksAndMessages(null)
         if (manager != null && channel != null) {
             manager.stopPeerDiscovery(channel, null)
         }
@@ -78,6 +101,7 @@ class WifiDirectManager(private val context: Context) {
     }
 
     fun connectToDevice(deviceAddress: String) {
+        _error.value = null
         val config = WifiP2pConfig().apply {
             this.deviceAddress = deviceAddress
             // Let the system negotiate the group owner
@@ -124,15 +148,47 @@ class WifiDirectManager(private val context: Context) {
                             }
                         }
                         WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
-                            val networkInfo = intent.getParcelableExtra<NetworkInfo>(WifiP2pManager.EXTRA_NETWORK_INFO)
-                            if (networkInfo?.isConnected == true) {
+                            @Suppress("DEPRECATION")
+                            val p2pInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_INFO, WifiP2pInfo::class.java)
+                            } else {
+                                intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_INFO)
+                            }
+                            @Suppress("DEPRECATION")
+                            val networkInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO, NetworkInfo::class.java)
+                            } else {
+                                intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO)
+                            }
+                            val isConnected = p2pInfo?.groupFormed == true || networkInfo?.isConnected == true
+                            if (isConnected) {
                                 manager?.requestConnectionInfo(channel) { info ->
-                                    _connectionInfo.value = info
-                                    _isDiscovering.value = false // Stop discovery UI once connected
+                                    if (info?.groupFormed == true) {
+                                        _connectionInfo.value = info
+                                        _isDiscovering.value = false
+                                    }
                                 }
                             } else {
                                 _connectionInfo.value = null
                             }
+                        }
+                        WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION -> {
+                            @Suppress("DEPRECATION")
+                            val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE, WifiP2pDevice::class.java)
+                            } else {
+                                intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE)
+                            }
+                            if (!device?.deviceName.isNullOrBlank()) {
+                                _thisDeviceName.value = device?.deviceName
+                            }
+                        }
+                        WifiP2pManager.WIFI_P2P_DISCOVERY_CHANGED_ACTION -> {
+                            val state = intent.getIntExtra(
+                                WifiP2pManager.EXTRA_DISCOVERY_STATE,
+                                WifiP2pManager.WIFI_P2P_DISCOVERY_STOPPED
+                            )
+                            _isDiscovering.value = state == WifiP2pManager.WIFI_P2P_DISCOVERY_STARTED
                         }
                     }
                 }

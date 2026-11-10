@@ -27,6 +27,14 @@ class ReceiverPairingViewModel : ViewModel() {
                     is SignalingEvent.JoinRejected -> {
                         _scanState.value = ReceiverState.Error("Connection rejected by sender")
                     }
+                    is SignalingEvent.JoinError -> {
+                        _scanState.value = ReceiverState.Error(event.message)
+                    }
+                    is SignalingEvent.ConnectionError -> {
+                        if (_scanState.value is ReceiverState.WaitingForSenderApproval) {
+                            _scanState.value = ReceiverState.Error("Signaling server unreachable")
+                        }
+                    }
                     else -> {}
                 }
             }
@@ -39,9 +47,9 @@ class ReceiverPairingViewModel : ViewModel() {
         try {
             val uri = Uri.parse(qrContent)
             if (uri.scheme == "tw" && uri.host == "pair") {
-                val sid = uri.getQueryParameter("sid")
-                val token = uri.getQueryParameter("token")
-                if (sid != null && token != null) {
+                val sid = uri.getQueryParameter("sid")?.trim()
+                val token = uri.getQueryParameter("token")?.trim()
+                if (!sid.isNullOrEmpty() && sid.length in 10..100 && !token.isNullOrEmpty() && token.length in 16..128) {
                     SignalingClient.joinSessionWithQr(sid, token)
                     _scanState.value = ReceiverState.WaitingForSenderApproval
                 } else {
@@ -58,7 +66,7 @@ class ReceiverPairingViewModel : ViewModel() {
     fun handlePinEntered(pin: String) {
         if (_scanState.value !is ReceiverState.Scanning) return
         
-        if (pin.length == 6) {
+        if (pin.length == 6 && pin.all { it.isDigit() }) {
             SignalingClient.joinSessionWithPin(pin)
             _scanState.value = ReceiverState.WaitingForSenderApproval
         } else {
@@ -76,7 +84,9 @@ class ReceiverPairingViewModel : ViewModel() {
     
     override fun onCleared() {
         super.onCleared()
-        SignalingClient.disconnect()
+        if (_scanState.value !is ReceiverState.Paired) {
+            SignalingClient.disconnect()
+        }
     }
 }
 

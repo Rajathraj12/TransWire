@@ -41,7 +41,17 @@ class SenderPairingViewModel : ViewModel() {
                         _joinRequestReceiverId.value = event.receiverId
                     }
                     is SignalingEvent.PeerJoined -> {
-                        _session.value = _session.value?.copy(status = PairingStatus.PAIRED)
+                        // Clear temporary pairing credentials from active UI state once paired
+                        _qrCodeBitmap.value = null
+                        _joinRequestReceiverId.value = null
+                        _session.value = _session.value?.copy(
+                            status = PairingStatus.PAIRED,
+                            pairingToken = "",
+                            pin = ""
+                        )
+                    }
+                    is SignalingEvent.JoinError -> {
+                        _session.value = _session.value?.copy(status = PairingStatus.EXPIRED)
                     }
                     else -> {}
                 }
@@ -54,6 +64,11 @@ class SenderPairingViewModel : ViewModel() {
     fun generateNewSession() {
         countdownJob?.cancel()
         _joinRequestReceiverId.value = null
+        _session.value?.sessionId?.let { previousId ->
+            if (_session.value?.status != PairingStatus.PAIRED) {
+                SignalingClient.leaveSession(previousId)
+            }
+        }
         
         val sessionId = PairingUtils.generateSessionId()
         val pairingToken = PairingUtils.generatePairingToken()
@@ -106,7 +121,13 @@ class SenderPairingViewModel : ViewModel() {
                 _timeRemainingSeconds.value -= 1
             }
             if (_session.value?.status != PairingStatus.PAIRED) {
-                _session.value = _session.value?.copy(status = PairingStatus.EXPIRED)
+                _qrCodeBitmap.value = null
+                _session.value?.sessionId?.let { SignalingClient.leaveSession(it) }
+                _session.value = _session.value?.copy(
+                    status = PairingStatus.EXPIRED,
+                    pairingToken = "",
+                    pin = ""
+                )
             }
         }
     }
@@ -114,6 +135,9 @@ class SenderPairingViewModel : ViewModel() {
     override fun onCleared() {
         super.onCleared()
         countdownJob?.cancel()
-        SignalingClient.disconnect()
+        if (_session.value?.status != PairingStatus.PAIRED) {
+            _session.value?.sessionId?.let { SignalingClient.leaveSession(it) }
+            SignalingClient.disconnect()
+        }
     }
 }

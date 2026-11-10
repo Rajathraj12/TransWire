@@ -4,11 +4,8 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewModelScope
-import com.example.myapplication.data.transport.TcpTransferTransport
 import com.example.myapplication.domain.repository.FileSelectionRepository
-import com.example.myapplication.domain.transfer.TransferManager
-import kotlinx.coroutines.launch
+import com.example.myapplication.service.TransferSessionCoordinator
 
 class TransferViewModel(
     application: Application,
@@ -17,21 +14,33 @@ class TransferViewModel(
     isGroupOwner: Boolean
 ) : AndroidViewModel(application) {
 
-    private val transferManager = TransferManager(
-        context = application,
-        transport = TcpTransferTransport(),
-        isGroupOwner = isGroupOwner,
-        hostIp = hostIp,
-        isSender = isSender
-    )
-
-    val progress = transferManager.progress
+    val progress = TransferSessionCoordinator.progress
 
     init {
-        viewModelScope.launch {
-            val files = if (isSender) FileSelectionRepository.selectedFiles else emptyList()
-            transferManager.start(files)
-        }
+        val files = if (isSender) FileSelectionRepository.selectedFiles else emptyList()
+        TransferSessionCoordinator.startTransfer(
+            context = application,
+            isSender = isSender,
+            hostIp = hostIp,
+            isGroupOwner = isGroupOwner,
+            files = files
+        )
+    }
+
+    fun retryTransfer() {
+        TransferSessionCoordinator.retryTransfer(getApplication())
+    }
+
+    fun cancelTransfer() {
+        TransferSessionCoordinator.cancelTransfer()
+    }
+
+    fun pauseTransfer() {
+        TransferSessionCoordinator.pauseTransfer()
+    }
+
+    fun resumeTransfer() {
+        TransferSessionCoordinator.resumeTransfer()
     }
 }
 

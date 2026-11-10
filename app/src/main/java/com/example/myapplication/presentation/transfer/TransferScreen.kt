@@ -1,16 +1,30 @@
 package com.example.myapplication.presentation.transfer
 
+import android.Manifest
 import android.app.Application
+import android.content.pm.PackageManager
+import android.os.Build
 import android.text.format.Formatter
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -18,7 +32,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.myapplication.data.storage.FileStorageManager
+import com.example.myapplication.domain.model.TransferredFileItem
 import java.util.concurrent.TimeUnit
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -38,6 +55,19 @@ fun TransferScreen(
     )
     
     val progress by viewModel.progress.collectAsState()
+    val fileStorageManager = remember(context) { FileStorageManager(context) }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ -> }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -65,7 +95,24 @@ fun TransferScreen(
         ) {
             
             if (progress.isCompleted) {
-                if (progress.error != null) {
+                if (progress.isCancelled) {
+                    Icon(
+                        imageVector = Icons.Default.Cancel,
+                        contentDescription = "Cancelled",
+                        modifier = Modifier.size(64.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = "Transfer Cancelled",
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    progress.error?.let {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(text = it, textAlign = TextAlign.Center)
+                    }
+                } else if (progress.error != null) {
                     Icon(
                         imageVector = Icons.Default.Error,
                         contentDescription = "Error",
@@ -78,6 +125,7 @@ fun TransferScreen(
                         style = MaterialTheme.typography.headlineSmall,
                         color = MaterialTheme.colorScheme.error
                     )
+                    Spacer(modifier = Modifier.height(4.dp))
                     Text(text = progress.error!!, textAlign = TextAlign.Center)
                 } else {
                     Icon(
@@ -92,10 +140,84 @@ fun TransferScreen(
                         style = MaterialTheme.typography.headlineSmall,
                         color = MaterialTheme.colorScheme.primary
                     )
+                    if (progress.transferredFiles.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (isSender) {
+                                "${progress.transferredFiles.size} file(s) sent"
+                            } else {
+                                "Saved to Downloads/Transwire • Tap a file to open"
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                    }
                 }
-                Spacer(modifier = Modifier.height(32.dp))
-                Button(onClick = onNavigateHome) {
-                    Text("Return to Home")
+
+                if (progress.transferredFiles.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = if (isSender) "Sent Files (${progress.transferredFiles.size})"
+                        else "Received Files (${progress.transferredFiles.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    LazyColumn(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(progress.transferredFiles, key = { it.fileId }) { item ->
+                            CompletedFileCard(
+                                item = item,
+                                context = context,
+                                onClick = {
+                                    fileStorageManager.openCompletedFile(
+                                        fileUriString = item.fileUri,
+                                        fileName = item.fileName,
+                                        mimeType = item.mimeType,
+                                        status = item.status
+                                    )
+                                }
+                            )
+                        }
+                    }
+                } else {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    if (progress.canRetry) {
+                        Button(
+                            onClick = { viewModel.retryTransfer() },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Retry")
+                        }
+                        OutlinedButton(
+                            onClick = onNavigateHome,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Home")
+                        }
+                    } else {
+                        Button(
+                            onClick = onNavigateHome,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Return to Home")
+                        }
+                    }
                 }
                 return@Column
             }
@@ -146,6 +268,30 @@ fun TransferScreen(
                     TransferStatRow("Time Remaining", etaFormatted)
                 }
             }
+            
+            Spacer(modifier = Modifier.weight(1f))
+            
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 32.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                OutlinedButton(
+                    onClick = { viewModel.cancelTransfer() },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Cancel")
+                }
+                
+                Button(
+                    onClick = { 
+                        if (progress.isPaused) viewModel.resumeTransfer() else viewModel.pauseTransfer()
+                    }
+                ) {
+                    Text(if (progress.isPaused) "Resume" else "Pause")
+                }
+            }
         }
     }
 }
@@ -167,5 +313,65 @@ fun TransferStatRow(label: String, value: String) {
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSecondaryContainer
         )
+    }
+}
+
+@Composable
+private fun CompletedFileCard(
+    item: TransferredFileItem,
+    context: android.content.Context,
+    onClick: () -> Unit
+) {
+    val formattedSize = Formatter.formatFileSize(context, item.size)
+    val isCompleted = item.status == "COMPLETED"
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.InsertDriveFile,
+                contentDescription = null,
+                tint = if (isCompleted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = item.fileName,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = if (isCompleted) "$formattedSize • Tap to open" else "$formattedSize • ${item.status}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isCompleted) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
+                )
+            }
+            if (isCompleted) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                    contentDescription = "Open file",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Default.Error,
+                    contentDescription = "Failed",
+                    tint = MaterialTheme.colorScheme.error
+                )
+            }
+        }
     }
 }

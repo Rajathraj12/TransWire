@@ -3,11 +3,14 @@ package com.example.myapplication.data.remote
 import android.util.Log
 import io.socket.client.IO
 import io.socket.client.Socket
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
 import org.json.JSONObject
+import org.webrtc.PeerConnection
+import java.net.HttpURLConnection
 import java.net.URISyntaxException
+import java.net.URL
 
 object SignalingClient {
     private var socket: Socket? = null
@@ -16,8 +19,13 @@ object SignalingClient {
     // For physical device testing, use the IP of the machine running Node.js: "http://192.168.x.x:3000"
     var serverUrl = "http://192.168.1.13:3000"
     
-    private val _events = MutableStateFlow<SignalingEvent?>(null)
-    val events: StateFlow<SignalingEvent?> = _events.asStateFlow()
+    var activeSessionId: String? = null
+    
+    private val _events = kotlinx.coroutines.flow.MutableSharedFlow<SignalingEvent>(
+        replay = 50, 
+        extraBufferCapacity = 50
+    )
+    val events = _events.asSharedFlow()
 
     fun connect() {
         if (socket?.connected() == true) return
@@ -26,65 +34,97 @@ object SignalingClient {
             
             socket?.on(Socket.EVENT_CONNECT) {
                 Log.d("SignalingClient", "Connected to signaling server")
-                _events.value = SignalingEvent.Connected
+                _events.tryEmit(SignalingEvent.Connected)
             }
             
             socket?.on(Socket.EVENT_CONNECT_ERROR) { args ->
-                Log.e("SignalingClient", "Connection error: ${args[0]}")
+                val detail = args.firstOrNull()?.toString() ?: "Unknown connection error"
+                Log.e("SignalingClient", "Connection error: $detail")
+                _events.tryEmit(SignalingEvent.ConnectionError(detail))
             }
             
             socket?.on("join-request") { args ->
-                val data = args[0] as JSONObject
-                _events.value = SignalingEvent.JoinRequest(data.getString("receiverId"))
+                val data = args.firstOrNull() as? JSONObject ?: return@on
+                val receiverId = data.optString("receiverId")
+                if (receiverId.isNotEmpty()) {
+                    _events.tryEmit(SignalingEvent.JoinRequest(receiverId))
+                }
             }
             
             socket?.on("peer-joined") {
-                _events.value = SignalingEvent.PeerJoined
+                _events.tryEmit(SignalingEvent.PeerJoined)
             }
             
             socket?.on("join-rejected") {
-                _events.value = SignalingEvent.JoinRejected
+                _events.tryEmit(SignalingEvent.JoinRejected)
             }
             
             socket?.on("peer-disconnected") {
-                _events.value = SignalingEvent.PeerDisconnected
+                _events.tryEmit(SignalingEvent.PeerDisconnected)
             }
 
             socket?.on("offer") { args ->
-                val data = args[0] as JSONObject
-                _events.value = SignalingEvent.OfferReceived(data.getString("sdp"))
+                val data = args.firstOrNull() as? JSONObject ?: return@on
+                val sdp = data.optString("sdp")
+                if (sdp.isNotEmpty()) {
+                    _events.tryEmit(SignalingEvent.OfferReceived(sdp))
+                }
             }
             
             socket?.on("answer") { args ->
-                val data = args[0] as JSONObject
-                _events.value = SignalingEvent.AnswerReceived(data.getString("sdp"))
+                val data = args.firstOrNull() as? JSONObject ?: return@on
+                val sdp = data.optString("sdp")
+                if (sdp.isNotEmpty()) {
+                    _events.tryEmit(SignalingEvent.AnswerReceived(sdp))
+                }
             }
             
             socket?.on("ice-candidate") { args ->
-                val data = args[0] as JSONObject
-                _events.value = SignalingEvent.IceCandidateReceived(data)
+                val data = args.firstOrNull() as? JSONObject ?: return@on
+                val candidateObj = data.optJSONObject("candidate") ?: return@on
+                val candidateStr = candidateObj.optString("candidate")
+                if (candidateStr.isNotEmpty()) {
+                    _events.tryEmit(SignalingEvent.IceCandidateReceived(
+                        candidateObj.optString("sdpMid", ""),
+                        candidateObj.optInt("sdpMLineIndex", 0),
+                        candidateStr
+                    ))
+                }
             }
             
             socket?.connect()
         } catch (e: URISyntaxException) {
-            e.printStackTrace()
+            Log.e("SignalingClient", "Invalid signaling URL", e)
         }
     }
 
     fun createSession(sessionId: String, token: String, pin: String) {
+        activeSessionId = sessionId
         val data = JSONObject().apply {
             put("sessionId", sessionId)
             put("pairingToken", token)
             put("pin", pin)
         }
-        socket?.emit("create-session", data)
+        socket?.emit("create-session", data, io.socket.client.Ack { args ->
+            val response = args.firstOrNull() as? JSONObject ?: return@Ack
+            if (!response.optBoolean("success", true)) {
+                _events.tryEmit(SignalingEvent.JoinError(response.optString("error", "Failed to create session")))
+            }
+        })
     }
 
     fun joinSessionWithPin(pin: String) {
         val data = JSONObject().apply {
             put("pin", pin)
         }
-        socket?.emit("join-session", data)
+        socket?.emit("join-session", data, io.socket.client.Ack { args ->
+            val response = args.firstOrNull() as? JSONObject ?: return@Ack
+            if (response.optBoolean("success")) {
+                activeSessionId = response.optString("sessionId").takeIf { it.isNotEmpty() }
+            } else {
+                _events.tryEmit(SignalingEvent.JoinError(response.optString("error", "Invalid or expired PIN")))
+            }
+        })
     }
     
     fun joinSessionWithQr(sessionId: String, token: String) {
@@ -92,7 +132,25 @@ object SignalingClient {
             put("sessionId", sessionId)
             put("pairingToken", token)
         }
-        socket?.emit("join-session", data)
+        socket?.emit("join-session", data, io.socket.client.Ack { args ->
+            val response = args.firstOrNull() as? JSONObject ?: return@Ack
+            if (response.optBoolean("success")) {
+                activeSessionId = response.optString("sessionId").takeIf { it.isNotEmpty() }
+            } else {
+                _events.tryEmit(SignalingEvent.JoinError(response.optString("error", "Invalid or expired QR session")))
+            }
+        })
+    }
+
+    fun leaveSession(sessionId: String? = activeSessionId) {
+        val sid = sessionId ?: return
+        val data = JSONObject().apply {
+            put("sessionId", sid)
+        }
+        socket?.emit("leave-session", data)
+        if (activeSessionId == sid) {
+            activeSessionId = null
+        }
     }
 
     fun approvePeer(sessionId: String, receiverId: String) {
@@ -111,24 +169,96 @@ object SignalingClient {
         socket?.emit("reject-peer", data)
     }
 
+    fun sendOffer(sdp: String) {
+        val data = JSONObject().apply {
+            put("sessionId", activeSessionId)
+            put("sdp", sdp)
+        }
+        socket?.emit("offer", data)
+    }
+
+    fun sendAnswer(sdp: String) {
+        val data = JSONObject().apply {
+            put("sessionId", activeSessionId)
+            put("sdp", sdp)
+        }
+        socket?.emit("answer", data)
+    }
+
+    fun sendIceCandidate(sdpMid: String, sdpMLineIndex: Int, candidate: String) {
+        val candidateObj = JSONObject().apply {
+            put("sdpMid", sdpMid)
+            put("sdpMLineIndex", sdpMLineIndex)
+            put("candidate", candidate)
+        }
+        val data = JSONObject().apply {
+            put("sessionId", activeSessionId)
+            put("candidate", candidateObj)
+        }
+        socket?.emit("ice-candidate", data)
+    }
+
+    suspend fun getTurnCredentials(): List<PeerConnection.IceServer> = withContext(Dispatchers.IO) {
+        val servers = mutableListOf<PeerConnection.IceServer>()
+        // Always add a public STUN server for direct P2P resolution
+        servers.add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
+        
+        try {
+            val querySuffix = activeSessionId?.let { "?sessionId=${java.net.URLEncoder.encode(it, "UTF-8")}" } ?: ""
+            val url = URL("$serverUrl/turn-credentials$querySuffix")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
+            activeSessionId?.let { conn.setRequestProperty("X-Session-Id", it) }
+            
+            if (conn.responseCode == 200) {
+                val response = conn.inputStream.bufferedReader().readText()
+                val json = JSONObject(response)
+                val username = json.getString("username")
+                val password = json.getString("password")
+                val uris = json.getJSONArray("uris")
+                
+                for (i in 0 until uris.length()) {
+                    servers.add(
+                        PeerConnection.IceServer.builder(uris.getString(i))
+                            .setUsername(username)
+                            .setPassword(password)
+                            .createIceServer()
+                    )
+                }
+                Log.d("SignalingClient", "Fetched TURN server configuration")
+            } else {
+                Log.e("SignalingClient", "Failed to fetch TURN configuration: HTTP ${conn.responseCode}")
+            }
+        } catch (e: Exception) {
+            Log.e("SignalingClient", "Error fetching TURN configuration", e)
+        }
+        
+        return@withContext servers
+    }
+
     fun disconnect() {
+        activeSessionId = null
         socket?.disconnect()
         socket = null
     }
     
     fun resetEvent() {
-        _events.value = null
+        // Can't directly reset SharedFlow, this is usually handled by observers tracking state
     }
 }
 
 sealed class SignalingEvent {
     object Connected : SignalingEvent()
+    data class ConnectionError(val message: String) : SignalingEvent()
     data class JoinRequest(val receiverId: String) : SignalingEvent()
+    data class JoinError(val message: String) : SignalingEvent()
     object PeerJoined : SignalingEvent()
     object JoinRejected : SignalingEvent()
     object PeerDisconnected : SignalingEvent()
     
     data class OfferReceived(val sdp: String) : SignalingEvent()
     data class AnswerReceived(val sdp: String) : SignalingEvent()
-    data class IceCandidateReceived(val candidate: JSONObject) : SignalingEvent()
+    data class IceCandidateReceived(val sdpMid: String, val sdpMLineIndex: Int, val candidate: String) : SignalingEvent()
 }

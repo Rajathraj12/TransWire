@@ -34,7 +34,7 @@ fun SendScreen(
     val context = LocalContext.current
     
     val launcher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenMultipleDocuments()
+        contract = ActivityResultContracts.GetMultipleContents()
     ) { uris ->
         if (uris.isNotEmpty()) {
             viewModel.addFiles(uris)
@@ -59,7 +59,7 @@ fun SendScreen(
         },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = { launcher.launch(arrayOf("*/*")) },
+                onClick = { launcher.launch("*/*") },
                 icon = { Icon(Icons.Default.Add, contentDescription = "Add Files") },
                 text = { Text("Select Files") }
             )
@@ -106,7 +106,7 @@ fun SendScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = "No files selected.\nTap the button below to add files.",
+                        text = "No files selected.\nTap the button below to add files.\n(Long-press a file to select multiple)",
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center

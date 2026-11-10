@@ -1,12 +1,39 @@
+import crypto from 'crypto';
 import { Session } from './types';
+
+const MAX_ACTIVE_SESSIONS = 5000;
+const MAX_FAILED_JOIN_ATTEMPTS_PER_SESSION = 5;
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const hashA = crypto.createHash('sha256').update(a).digest();
+  const hashB = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
 
 class SessionManager {
   private sessions = new Map<string, Session>();
   private pinToSessionId = new Map<string, string>();
 
-  createSession(session: Session) {
+  createSession(session: Session): boolean {
+    this.cleanupExpiredSessions();
+    if (this.sessions.size >= MAX_ACTIVE_SESSIONS) {
+      return false;
+    }
+
+    // Ensure one active pending session per sender socket
+    for (const [existingId, existing] of this.sessions.entries()) {
+      if (existing.senderSocketId === session.senderSocketId && existing.status !== 'PAIRED') {
+        this.removeSession(existingId);
+      }
+    }
+
+    if (this.sessions.has(session.sessionId)) {
+      return false;
+    }
+
     this.sessions.set(session.sessionId, session);
     this.pinToSessionId.set(session.pin, session.sessionId);
+    return true;
   }
 
   getSessionById(sessionId: string): Session | undefined {
@@ -21,13 +48,36 @@ class SessionManager {
   getSessionByPin(pin: string): Session | undefined {
     const sessionId = this.pinToSessionId.get(pin);
     if (!sessionId) return undefined;
-    return this.getSessionById(sessionId);
+    const session = this.getSessionById(sessionId);
+    if (!session || !timingSafeStringEqual(session.pin, pin)) {
+      return undefined;
+    }
+    return session;
+  }
+
+  verifyPairingToken(session: Session, candidateToken: string): boolean {
+    if (timingSafeStringEqual(session.pairingToken, candidateToken)) {
+      return true;
+    }
+    this.recordFailedAttempt(session.sessionId);
+    return false;
+  }
+
+  recordFailedAttempt(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    session.failedAttempts += 1;
+    if (session.failedAttempts >= MAX_FAILED_JOIN_ATTEMPTS_PER_SESSION) {
+      this.removeSession(sessionId);
+      return true; // Locked & purged
+    }
+    return false;
   }
 
   updateSession(sessionId: string, updates: Partial<Session>) {
     const session = this.sessions.get(sessionId);
     if (session) {
-      Object.assign(session, updates);
+      Object.assign(session, updates, { lastActivityAt: Date.now() });
     }
   }
 

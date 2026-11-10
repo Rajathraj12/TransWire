@@ -7,5 +7,6 @@ interface TransferTransport {
     suspend fun initAsClient(host: String, port: Int)
     suspend fun writeMessage(message: TransferMessage)
     suspend fun readMessage(): TransferMessage
+    suspend fun flush() {}
     fun disconnect()
 }

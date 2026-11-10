@@ -11,6 +11,7 @@ class NearbyDiscoveryViewModel(application: Application) : AndroidViewModel(appl
     val peers = wifiDirectManager.peers
     val connectionInfo = wifiDirectManager.connectionInfo
     val isDiscovering = wifiDirectManager.isDiscovering
+    val thisDeviceName = wifiDirectManager.thisDeviceName
     val error = wifiDirectManager.error
 
     fun startDiscovery() {

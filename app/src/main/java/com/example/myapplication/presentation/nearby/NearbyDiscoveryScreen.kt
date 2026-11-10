@@ -14,7 +14,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Wifi
@@ -23,10 +22,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -43,7 +42,9 @@ fun NearbyDiscoveryScreen(
     val isDiscovering by viewModel.isDiscovering.collectAsState()
     val peers by viewModel.peers.collectAsState()
     val connectionInfo by viewModel.connectionInfo.collectAsState()
+    val thisDeviceName by viewModel.thisDeviceName.collectAsState()
     val error by viewModel.error.collectAsState()
+    var hasAutoStartedSender by remember { mutableStateOf(false) }
 
     val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
@@ -66,9 +67,6 @@ fun NearbyDiscoveryScreen(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         hasPermissions = permissions.values.all { it }
-        if (hasPermissions) {
-            viewModel.startDiscovery()
-        }
     }
 
     LaunchedEffect(hasPermissions) {
@@ -76,6 +74,16 @@ fun NearbyDiscoveryScreen(
             permissionLauncher.launch(requiredPermissions)
         } else {
             viewModel.startDiscovery()
+        }
+    }
+
+    // Sender automatically enters transfer screen once Wi-Fi Direct group forms and waits for receiver acceptance
+    LaunchedEffect(isSender, connectionInfo) {
+        val info = connectionInfo
+        if (isSender && !hasAutoStartedSender && info != null && info.groupFormed && info.groupOwnerAddress != null) {
+            hasAutoStartedSender = true
+            val ip = info.groupOwnerAddress?.hostAddress ?: ""
+            onNavigateToTransfer(ip, info.isGroupOwner)
         }
     }
 
@@ -88,7 +96,7 @@ fun NearbyDiscoveryScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Nearby Discovery") },
+                title = { Text(if (isSender) "Find Receiver Nearby" else "Receive Nearby") },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -119,9 +127,9 @@ fun NearbyDiscoveryScreen(
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
-                            text = "Location/Nearby permissions are required\nfor Wi-Fi Direct discovery.",
+                            text = "Location/Nearby permissions are required\nfor Wi-Fi Direct transfer.",
                             style = MaterialTheme.typography.bodyLarge,
-                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            textAlign = TextAlign.Center
                         )
                         Spacer(modifier = Modifier.height(16.dp))
                         Button(onClick = { permissionLauncher.launch(requiredPermissions) }) {
@@ -132,8 +140,9 @@ fun NearbyDiscoveryScreen(
                 return@Scaffold
             }
 
-            if (connectionInfo != null) {
-                // Connected State UI
+            if (connectionInfo != null && connectionInfo!!.groupFormed) {
+                val info = connectionInfo!!
+                val ip = info.groupOwnerAddress?.hostAddress ?: ""
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -149,53 +158,63 @@ fun NearbyDiscoveryScreen(
                     )
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
-                        text = "Successfully Connected!",
+                        text = if (isSender) "Connected to Receiver" else "Incoming Nearby Transfer",
                         style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = if (connectionInfo!!.isGroupOwner) {
-                            "Role: Group Owner\nIP Address: ${connectionInfo!!.groupOwnerAddress?.hostAddress}"
+                        text = if (isSender) {
+                            "Ready to send files.\nWaiting for receiver to accept."
                         } else {
-                            "Role: Client\nGroup Owner IP: ${connectionInfo!!.groupOwnerAddress?.hostAddress}"
+                            "A nearby sender wants to send files to this device.\nAccept to begin receiving."
                         },
                         style = MaterialTheme.typography.bodyLarge,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(modifier = Modifier.height(32.dp))
+
                     Button(
-                        onClick = { 
-                            val ip = connectionInfo!!.groupOwnerAddress?.hostAddress ?: ""
-                            onNavigateToTransfer(ip, connectionInfo!!.isGroupOwner)
-                        },
-                        modifier = Modifier.fillMaxWidth().height(56.dp)
+                        onClick = { onNavigateToTransfer(ip, info.isGroupOwner) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(56.dp)
                     ) {
-                        Text("Start Transfer")
+                        Text(if (isSender) "Start Sending" else "Accept & Receive Files")
                     }
+
                     Spacer(modifier = Modifier.height(16.dp))
                     OutlinedButton(
-                        onClick = { viewModel.disconnect() },
+                        onClick = {
+                            hasAutoStartedSender = false
+                            viewModel.disconnect()
+                            viewModel.startDiscovery()
+                        },
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
                     ) {
-                        Text("Disconnect")
+                        Text(if (isSender) "Disconnect" else "Decline")
                     }
                 }
-            } else {
-                // Discovery UI
-                error?.let {
-                    Surface(
-                        color = MaterialTheme.colorScheme.errorContainer,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = it,
-                            modifier = Modifier.padding(16.dp),
-                            color = MaterialTheme.colorScheme.onErrorContainer
-                        )
-                    }
-                }
+                return@Scaffold
+            }
 
+            error?.let {
+                Surface(
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = it,
+                        modifier = Modifier.padding(16.dp),
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                }
+            }
+
+            if (isSender) {
+                // Sender-only discovery: search for nearby receivers and connect
                 if (isDiscovering) {
                     Box(
                         modifier = Modifier
@@ -206,9 +225,9 @@ fun NearbyDiscoveryScreen(
                         RadarAnimation()
                     }
                     Text(
-                        text = "Searching for nearby devices...",
+                        text = "Searching for nearby receivers...",
                         modifier = Modifier.fillMaxWidth(),
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        textAlign = TextAlign.Center,
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.primary
                     )
@@ -216,10 +235,28 @@ fun NearbyDiscoveryScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .weight(1f),
+                            .weight(1f)
+                            .padding(24.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("No devices found.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = "No nearby receivers found.",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Ask the receiver to open Receive > Nearby Transfer.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                textAlign = TextAlign.Center,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Button(onClick = { viewModel.startDiscovery() }) {
+                                Text("Scan Again")
+                            }
+                        }
                     }
                 }
 
@@ -230,12 +267,12 @@ fun NearbyDiscoveryScreen(
                 ) {
                     items(peers, key = { it.deviceAddress }) { peer ->
                         ListItem(
-                            headlineContent = { Text(peer.deviceName, fontWeight = FontWeight.Bold) },
-                            supportingContent = { Text(peer.deviceAddress) },
+                            headlineContent = { Text(peer.deviceName.ifBlank { "Nearby Device" }, fontWeight = FontWeight.Bold) },
+                            supportingContent = { Text("Tap to send files • ${peer.deviceAddress}") },
                             leadingContent = {
                                 Icon(
                                     imageVector = Icons.Default.PhoneAndroid,
-                                    contentDescription = "Device",
+                                    contentDescription = "Receiver Device",
                                     tint = MaterialTheme.colorScheme.primary
                                 )
                             },
@@ -243,7 +280,47 @@ fun NearbyDiscoveryScreen(
                                 viewModel.connectTo(peer.deviceAddress)
                             }
                         )
-                        Divider()
+                        HorizontalDivider()
+                    }
+                }
+            } else {
+                // Receiver-only standby: visible to nearby senders and waits to accept
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    RadarAnimation()
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Text(
+                        text = "Waiting for Sender",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    if (!thisDeviceName.isNullOrBlank()) {
+                        Text(
+                            text = "Device Name: $thisDeviceName",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+                    Text(
+                        text = "Your device is visible to nearby senders.\nOnce a sender connects, you can accept to start the transfer.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(24.dp))
+                    if (!isDiscovering) {
+                        OutlinedButton(onClick = { viewModel.startDiscovery() }) {
+                            Icon(Icons.Default.Refresh, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Make Discoverable Again")
+                        }
                     }
                 }
             }
