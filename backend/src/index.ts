@@ -71,9 +71,13 @@ app.get('/turn-credentials', turnLimiter, (req, res) => {
     }
   }
 
-  const turnSecret = process.env.TURN_SHARED_SECRET || 'dev-secret';
-  const turnServer = process.env.TURN_SERVER_URL || '';
-  if (!turnServer) {
+  const turnUrlsRaw = process.env.TURN_SERVER_URLS || process.env.TURN_SERVER_URL || '';
+  const uris = turnUrlsRaw
+    .split(',')
+    .map((u) => u.trim())
+    .filter((u) => u.length > 0);
+
+  if (uris.length === 0) {
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
       uris: [],
@@ -81,6 +85,22 @@ app.get('/turn-credentials', turnLimiter, (req, res) => {
       password: ''
     });
   }
+
+  // Option A: Static TURN credentials (e.g., Metered Open Relay / hosted TURN provider)
+  const staticUsername = process.env.TURN_USERNAME?.trim();
+  const staticPassword = process.env.TURN_PASSWORD?.trim();
+  if (staticUsername && staticPassword) {
+    console.log(`[TURN] Issued static relay configuration for ${req.ip}`);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({
+      uris,
+      username: staticUsername,
+      password: staticPassword
+    });
+  }
+
+  // Option B: Ephemeral Coturn HMAC credentials (use-auth-secret)
+  const turnSecret = process.env.TURN_SHARED_SECRET || 'dev-secret';
   if (process.env.NODE_ENV === 'production' && turnSecret === 'dev-secret') {
     console.warn('[TURN] WARNING: Using default TURN_SHARED_SECRET in production');
   }
@@ -98,7 +118,7 @@ app.get('/turn-credentials', turnLimiter, (req, res) => {
 
   res.setHeader('Cache-Control', 'no-store');
   res.json({
-    uris: [turnServer],
+    uris,
     username,
     password
   });

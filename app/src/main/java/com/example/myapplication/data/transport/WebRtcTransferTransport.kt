@@ -30,11 +30,17 @@ class WebRtcTransferTransport(
     private val messageChannel = Channel<TransferMessage>(Channel.UNLIMITED)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val writeMutex = Mutex()
+    private val iceLock = Any()
+    private val pendingRemoteIceCandidates = mutableListOf<IceCandidate>()
+
+    @Volatile
+    private var remoteDescriptionSet = false
+
     @Volatile
     private var closedReason: Throwable? = null
 
     companion object {
-        private const val CONNECT_TIMEOUT_MS = 30_000L
+        private const val CONNECT_TIMEOUT_MS = 45_000L
         private const val READ_TIMEOUT_MS = 30_000L
     }
 
@@ -71,14 +77,112 @@ class WebRtcTransferTransport(
         }
     }
 
+    private suspend fun awaitCreateOffer(pc: PeerConnection): SessionDescription {
+        val deferred = CompletableDeferred<SessionDescription>()
+        pc.createOffer(object : SimpleSdpObserver() {
+            override fun onCreateSuccess(desc: SessionDescription?) {
+                if (desc != null) deferred.complete(desc)
+                else deferred.completeExceptionally(IOException("Empty SDP offer"))
+            }
+
+            override fun onCreateFailure(error: String?) {
+                deferred.completeExceptionally(IOException("Offer failed: $error"))
+            }
+        }, MediaConstraints())
+        return withTimeout(CONNECT_TIMEOUT_MS) { deferred.await() }
+    }
+
+    private suspend fun awaitCreateAnswer(pc: PeerConnection): SessionDescription {
+        val deferred = CompletableDeferred<SessionDescription>()
+        pc.createAnswer(object : SimpleSdpObserver() {
+            override fun onCreateSuccess(desc: SessionDescription?) {
+                if (desc != null) deferred.complete(desc)
+                else deferred.completeExceptionally(IOException("Empty SDP answer"))
+            }
+
+            override fun onCreateFailure(error: String?) {
+                deferred.completeExceptionally(IOException("Answer failed: $error"))
+            }
+        }, MediaConstraints())
+        return withTimeout(CONNECT_TIMEOUT_MS) { deferred.await() }
+    }
+
+    private suspend fun awaitSetLocalDescription(pc: PeerConnection, desc: SessionDescription) {
+        val deferred = CompletableDeferred<Unit>()
+        pc.setLocalDescription(object : SimpleSdpObserver() {
+            override fun onSetSuccess() {
+                deferred.complete(Unit)
+            }
+
+            override fun onSetFailure(error: String?) {
+                deferred.completeExceptionally(IOException("Failed setting local SDP: $error"))
+            }
+        }, desc)
+        withTimeout(CONNECT_TIMEOUT_MS) { deferred.await() }
+    }
+
+    private suspend fun awaitSetRemoteDescription(pc: PeerConnection, desc: SessionDescription) {
+        val deferred = CompletableDeferred<Unit>()
+        pc.setRemoteDescription(object : SimpleSdpObserver() {
+            override fun onSetSuccess() {
+                deferred.complete(Unit)
+            }
+
+            override fun onSetFailure(error: String?) {
+                deferred.completeExceptionally(IOException("Failed setting remote SDP: $error"))
+            }
+        }, desc)
+        withTimeout(CONNECT_TIMEOUT_MS) { deferred.await() }
+
+        val toAdd: List<IceCandidate>
+        synchronized(iceLock) {
+            remoteDescriptionSet = true
+            toAdd = pendingRemoteIceCandidates.toList()
+            pendingRemoteIceCandidates.clear()
+        }
+        toAdd.forEach { pc.addIceCandidate(it) }
+    }
+
+    private fun handleRemoteIceCandidate(candidate: IceCandidate) {
+        val pc = peerConnection ?: return
+        val shouldAddNow: Boolean
+        synchronized(iceLock) {
+            if (remoteDescriptionSet) {
+                shouldAddNow = true
+            } else {
+                pendingRemoteIceCandidates.add(candidate)
+                shouldAddNow = false
+            }
+        }
+        if (shouldAddNow) {
+            pc.addIceCandidate(candidate)
+        }
+    }
+
+    private fun hasTurnServer(iceServers: List<PeerConnection.IceServer>): Boolean =
+        iceServers.any { server ->
+            server.urls.any { it.startsWith("turn:", ignoreCase = true) || it.startsWith("turns:", ignoreCase = true) }
+        }
+
+    private fun buildConnectionFailureMessage(hasTurn: Boolean, detail: String): String {
+        return if (!hasTurn) {
+            "Could not connect peer-to-peer across these networks (no TURN relay configured on server). Configure TURN on your backend or use Nearby Wi-Fi Direct."
+        } else {
+            detail
+        }
+    }
+
     override suspend fun initAsServer(port: Int) {
         initFactory()
         closedReason = null
+        remoteDescriptionSet = false
+        synchronized(iceLock) { pendingRemoteIceCandidates.clear() }
 
         val iceServers = SignalingClient.getTurnCredentials()
+        val hasTurn = hasTurnServer(iceServers)
         val dcDeferred = CompletableDeferred<Unit>()
 
-        peerConnection = peerConnectionFactory?.createPeerConnection(
+        val pc = peerConnectionFactory?.createPeerConnection(
             iceServers,
             object : SimplePeerConnectionObserver() {
                 override fun onIceCandidate(candidate: IceCandidate?) {
@@ -92,18 +196,17 @@ class WebRtcTransferTransport(
                     if (newState == PeerConnection.IceConnectionState.FAILED ||
                         newState == PeerConnection.IceConnectionState.CLOSED
                     ) {
-                        val err = IOException("WebRTC ICE connection $newState")
+                        val err = IOException(buildConnectionFailureMessage(hasTurn, "WebRTC ICE connection $newState"))
                         dcDeferred.completeExceptionally(err)
                         failChannel(err)
                     }
                 }
             }
         ) ?: throw IOException("Failed to create PeerConnection")
+        peerConnection = pc
 
-        val dcInit = DataChannel.Init().apply {
-            ordered = true
-        }
-        dataChannel = peerConnection?.createDataChannel("fileTransfer", dcInit)
+        val dcInit = DataChannel.Init().apply { ordered = true }
+        dataChannel = pc.createDataChannel("fileTransfer", dcInit)
         dataChannel?.registerObserver(object : DataChannel.Observer {
             override fun onBufferedAmountChange(p0: Long) {}
             override fun onStateChange() {
@@ -123,61 +226,62 @@ class WebRtcTransferTransport(
             }
         })
 
-        val sdpDeferred = CompletableDeferred<SessionDescription>()
-        peerConnection?.createOffer(object : SimpleSdpObserver() {
-            override fun onCreateSuccess(desc: SessionDescription?) {
-                desc?.let {
-                    peerConnection?.setLocalDescription(SimpleSdpObserver(), it)
-                    sdpDeferred.complete(it)
+        // Start signaling listener BEFORE sending offer so early answer/ICE signals are never missed
+        suspend fun processServerSignal(event: SignalingEvent) {
+            when (event) {
+                is SignalingEvent.AnswerReceived -> {
+                    val answer = SessionDescription(SessionDescription.Type.ANSWER, event.sdp)
+                    awaitSetRemoteDescription(pc, answer)
                 }
-            }
-
-            override fun onCreateFailure(s: String?) {
-                sdpDeferred.completeExceptionally(IOException("Offer failed: $s"))
-            }
-        }, MediaConstraints())
-
-        val offerDesc = withTimeout(CONNECT_TIMEOUT_MS) { sdpDeferred.await() }
-        SignalingClient.sendOffer(offerDesc.description)
-
-        signalingJob = scope.launch {
-            SignalingClient.events.collect { event ->
-                when (event) {
-                    is SignalingEvent.AnswerReceived -> {
-                        val answer = SessionDescription(SessionDescription.Type.ANSWER, event.sdp)
-                        peerConnection?.setRemoteDescription(SimpleSdpObserver(), answer)
-                    }
-                    is SignalingEvent.IceCandidateReceived -> {
-                        val ice = IceCandidate(event.sdpMid, event.sdpMLineIndex, event.candidate)
-                        peerConnection?.addIceCandidate(ice)
-                    }
-                    is SignalingEvent.PeerDisconnected -> {
-                        val err = IOException("Peer disconnected from signaling session")
-                        dcDeferred.completeExceptionally(err)
-                        failChannel(err)
-                    }
-                    else -> {}
+                is SignalingEvent.IceCandidateReceived -> {
+                    val ice = IceCandidate(event.sdpMid, event.sdpMLineIndex, event.candidate)
+                    handleRemoteIceCandidate(ice)
                 }
+                is SignalingEvent.PeerDisconnected -> {
+                    val err = IOException("Receiver disconnected from signaling session")
+                    dcDeferred.completeExceptionally(err)
+                    failChannel(err)
+                }
+                else -> {}
             }
         }
+
+        val buffered = SignalingClient.drainBufferedWebRtcSignals()
+        signalingJob = scope.launch {
+            for (event in buffered) {
+                processServerSignal(event)
+            }
+            SignalingClient.events.collect { event ->
+                processServerSignal(event)
+            }
+        }
+
+        val offerDesc = awaitCreateOffer(pc)
+        awaitSetLocalDescription(pc, offerDesc)
+        SignalingClient.sendOffer(offerDesc.description)
 
         try {
             withTimeout(CONNECT_TIMEOUT_MS) {
                 dcDeferred.await()
             }
-        } catch (e: TimeoutCancellationException) {
-            throw SocketTimeoutException("Timed out establishing WebRTC data channel")
+        } catch (_: TimeoutCancellationException) {
+            throw SocketTimeoutException(
+                buildConnectionFailureMessage(hasTurn, "Timed out establishing WebRTC data channel")
+            )
         }
     }
 
     override suspend fun initAsClient(host: String, port: Int) {
         initFactory()
         closedReason = null
+        remoteDescriptionSet = false
+        synchronized(iceLock) { pendingRemoteIceCandidates.clear() }
 
         val iceServers = SignalingClient.getTurnCredentials()
+        val hasTurn = hasTurnServer(iceServers)
         val dcDeferred = CompletableDeferred<Unit>()
 
-        peerConnection = peerConnectionFactory?.createPeerConnection(
+        val pc = peerConnectionFactory?.createPeerConnection(
             iceServers,
             object : SimplePeerConnectionObserver() {
                 override fun onIceCandidate(candidate: IceCandidate?) {
@@ -191,7 +295,7 @@ class WebRtcTransferTransport(
                     if (newState == PeerConnection.IceConnectionState.FAILED ||
                         newState == PeerConnection.IceConnectionState.CLOSED
                     ) {
-                        val err = IOException("WebRTC ICE connection $newState")
+                        val err = IOException(buildConnectionFailureMessage(hasTurn, "WebRTC ICE connection $newState"))
                         dcDeferred.completeExceptionally(err)
                         failChannel(err)
                     }
@@ -222,46 +326,38 @@ class WebRtcTransferTransport(
                 }
             }
         ) ?: throw IOException("Failed to create PeerConnection")
+        peerConnection = pc
 
-        signalingJob = scope.launch {
-            SignalingClient.events.collect { event ->
-                when (event) {
-                    is SignalingEvent.OfferReceived -> {
-                        val offer = SessionDescription(SessionDescription.Type.OFFER, event.sdp)
-                        peerConnection?.setRemoteDescription(SimpleSdpObserver(), offer)
-
-                        val sdpDeferred = CompletableDeferred<SessionDescription>()
-                        peerConnection?.createAnswer(object : SimpleSdpObserver() {
-                            override fun onCreateSuccess(desc: SessionDescription?) {
-                                desc?.let {
-                                    peerConnection?.setLocalDescription(SimpleSdpObserver(), it)
-                                    sdpDeferred.complete(it)
-                                }
-                            }
-
-                            override fun onCreateFailure(s: String?) {
-                                sdpDeferred.completeExceptionally(IOException("Answer failed: $s"))
-                            }
-                        }, MediaConstraints())
-
-                        val answerDesc = sdpDeferred.await()
-                        SignalingClient.sendAnswer(answerDesc.description)
-                    }
-                    is SignalingEvent.AnswerReceived -> {
-                        val answer = SessionDescription(SessionDescription.Type.ANSWER, event.sdp)
-                        peerConnection?.setRemoteDescription(SimpleSdpObserver(), answer)
-                    }
-                    is SignalingEvent.IceCandidateReceived -> {
-                        val ice = IceCandidate(event.sdpMid, event.sdpMLineIndex, event.candidate)
-                        peerConnection?.addIceCandidate(ice)
-                    }
-                    is SignalingEvent.PeerDisconnected -> {
-                        val err = IOException("Peer disconnected from signaling session")
-                        dcDeferred.completeExceptionally(err)
-                        failChannel(err)
-                    }
-                    else -> {}
+        suspend fun processClientSignal(event: SignalingEvent) {
+            when (event) {
+                is SignalingEvent.OfferReceived -> {
+                    val offer = SessionDescription(SessionDescription.Type.OFFER, event.sdp)
+                    awaitSetRemoteDescription(pc, offer)
+                    val answerDesc = awaitCreateAnswer(pc)
+                    awaitSetLocalDescription(pc, answerDesc)
+                    SignalingClient.sendAnswer(answerDesc.description)
                 }
+                is SignalingEvent.IceCandidateReceived -> {
+                    val ice = IceCandidate(event.sdpMid, event.sdpMLineIndex, event.candidate)
+                    handleRemoteIceCandidate(ice)
+                }
+                is SignalingEvent.PeerDisconnected -> {
+                    val err = IOException("Sender disconnected from signaling session")
+                    dcDeferred.completeExceptionally(err)
+                    failChannel(err)
+                }
+                else -> {}
+            }
+        }
+
+        // Process buffered offer & early ICE candidates emitted while user tapped Start Receiving
+        val buffered = SignalingClient.drainBufferedWebRtcSignals()
+        signalingJob = scope.launch {
+            for (event in buffered) {
+                processClientSignal(event)
+            }
+            SignalingClient.events.collect { event ->
+                processClientSignal(event)
             }
         }
 
@@ -269,8 +365,10 @@ class WebRtcTransferTransport(
             withTimeout(CONNECT_TIMEOUT_MS) {
                 dcDeferred.await()
             }
-        } catch (e: TimeoutCancellationException) {
-            throw SocketTimeoutException("Timed out establishing WebRTC data channel")
+        } catch (_: TimeoutCancellationException) {
+            throw SocketTimeoutException(
+                buildConnectionFailureMessage(hasTurn, "Timed out establishing WebRTC data channel")
+            )
         }
     }
 
@@ -308,7 +406,7 @@ class WebRtcTransferTransport(
             withTimeout(READ_TIMEOUT_MS) {
                 messageChannel.receive()
             }
-        } catch (e: TimeoutCancellationException) {
+        } catch (_: TimeoutCancellationException) {
             throw SocketTimeoutException("Timed out waiting for peer message")
         } catch (e: ClosedReceiveChannelException) {
             throw (closedReason ?: IOException("Connection closed by peer", e))

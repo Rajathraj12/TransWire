@@ -30,12 +30,35 @@ object SignalingClient {
 
     @Volatile
     private var pendingJoinPayload: JSONObject? = null
-    
+
+    private val bufferedWebRtcSignals = mutableListOf<SignalingEvent>()
+
+    // replay = 0 prevents old PeerJoined / JoinError events from replaying into fresh screens
     private val _events = kotlinx.coroutines.flow.MutableSharedFlow<SignalingEvent>(
-        replay = 50, 
-        extraBufferCapacity = 50
+        replay = 0,
+        extraBufferCapacity = 64
     )
     val events = _events.asSharedFlow()
+
+    fun drainBufferedWebRtcSignals(): List<SignalingEvent> = synchronized(bufferedWebRtcSignals) {
+        val copy = bufferedWebRtcSignals.toList()
+        bufferedWebRtcSignals.clear()
+        copy
+    }
+
+    fun clearWebRtcSignals() = synchronized(bufferedWebRtcSignals) {
+        bufferedWebRtcSignals.clear()
+    }
+
+    private fun recordAndEmitWebRtcSignal(event: SignalingEvent) {
+        synchronized(bufferedWebRtcSignals) {
+            if (bufferedWebRtcSignals.size >= 120) {
+                bufferedWebRtcSignals.removeAt(0)
+            }
+            bufferedWebRtcSignals.add(event)
+        }
+        _events.tryEmit(event)
+    }
 
     fun updateServerUrl(rawUrl: String): Boolean {
         val normalized = rawUrl.trim().trimEnd('/')
@@ -136,7 +159,7 @@ object SignalingClient {
                 val data = args.firstOrNull() as? JSONObject ?: return@on
                 val sdp = data.optString("sdp")
                 if (sdp.isNotEmpty()) {
-                    _events.tryEmit(SignalingEvent.OfferReceived(sdp))
+                    recordAndEmitWebRtcSignal(SignalingEvent.OfferReceived(sdp))
                 }
             }
             
@@ -144,7 +167,7 @@ object SignalingClient {
                 val data = args.firstOrNull() as? JSONObject ?: return@on
                 val sdp = data.optString("sdp")
                 if (sdp.isNotEmpty()) {
-                    _events.tryEmit(SignalingEvent.AnswerReceived(sdp))
+                    recordAndEmitWebRtcSignal(SignalingEvent.AnswerReceived(sdp))
                 }
             }
             
@@ -153,11 +176,13 @@ object SignalingClient {
                 val candidateObj = data.optJSONObject("candidate") ?: return@on
                 val candidateStr = candidateObj.optString("candidate")
                 if (candidateStr.isNotEmpty()) {
-                    _events.tryEmit(SignalingEvent.IceCandidateReceived(
-                        candidateObj.optString("sdpMid", ""),
-                        candidateObj.optInt("sdpMLineIndex", 0),
-                        candidateStr
-                    ))
+                    recordAndEmitWebRtcSignal(
+                        SignalingEvent.IceCandidateReceived(
+                            candidateObj.optString("sdpMid", ""),
+                            candidateObj.optInt("sdpMLineIndex", 0),
+                            candidateStr
+                        )
+                    )
                 }
             }
             
@@ -168,6 +193,7 @@ object SignalingClient {
     }
 
     fun createSession(sessionId: String, token: String, pin: String) {
+        clearWebRtcSignals()
         activeSessionId = sessionId
         val data = JSONObject().apply {
             put("sessionId", sessionId)
@@ -196,6 +222,7 @@ object SignalingClient {
     }
 
     fun joinSessionWithPin(pin: String) {
+        clearWebRtcSignals()
         val data = JSONObject().apply {
             put("pin", pin)
         }
@@ -208,6 +235,7 @@ object SignalingClient {
     }
 
     fun joinSessionWithQr(sessionId: String, token: String) {
+        clearWebRtcSignals()
         val data = JSONObject().apply {
             put("sessionId", sessionId)
             put("pairingToken", token)
@@ -237,6 +265,7 @@ object SignalingClient {
             pendingCreatePayload = null
         }
         pendingJoinPayload = null
+        clearWebRtcSignals()
         val data = JSONObject().apply {
             put("sessionId", sid)
         }
@@ -293,8 +322,10 @@ object SignalingClient {
 
     suspend fun getTurnCredentials(): List<PeerConnection.IceServer> = withContext(Dispatchers.IO) {
         val servers = mutableListOf<PeerConnection.IceServer>()
-        // Always add a public STUN server for direct P2P resolution
+        // Public STUN servers for direct P2P resolution across home/cone NATs
         servers.add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
+        servers.add(PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer())
+        servers.add(PeerConnection.IceServer.builder("stun:stun.cloudflare.com:3478").createIceServer())
         
         try {
             val querySuffix = activeSessionId?.let { "?sessionId=${java.net.URLEncoder.encode(it, "UTF-8")}" } ?: ""
@@ -335,6 +366,7 @@ object SignalingClient {
         activeSessionId = null
         pendingCreatePayload = null
         pendingJoinPayload = null
+        clearWebRtcSignals()
         socket?.off()
         socket?.disconnect()
         socket = null

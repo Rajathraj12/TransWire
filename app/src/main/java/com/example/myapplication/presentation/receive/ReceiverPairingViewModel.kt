@@ -105,6 +105,16 @@ class ReceiverPairingViewModel : ViewModel() {
     fun resetScan() {
         failedAttempts = 0
         _isDecodingImage.value = false
+        SignalingClient.leaveSession()
+        SignalingClient.clearWebRtcSignals()
+        _scanState.value = ReceiverState.Scanning
+    }
+
+    fun cancelPairing() {
+        failedAttempts = 0
+        _isDecodingImage.value = false
+        SignalingClient.leaveSession()
+        SignalingClient.disconnect()
         _scanState.value = ReceiverState.Scanning
     }
 

@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.text.format.Formatter
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
@@ -37,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.myapplication.data.remote.SignalingClient
 import com.example.myapplication.data.storage.FileStorageManager
 import com.example.myapplication.domain.model.TransferProgress
 import com.example.myapplication.domain.model.TransferredFileItem
@@ -69,12 +71,31 @@ fun TransferScreen(
         }
     }
 
+    fun terminateRemoteSessionIfLeaving() {
+        if (hostIp == "0.0.0.0") {
+            SignalingClient.leaveSession()
+            SignalingClient.disconnect()
+        }
+    }
+
+    BackHandler {
+        if (progress.isCompleted) {
+            terminateRemoteSessionIfLeaving()
+        }
+        onNavigateBack()
+    }
+
     Scaffold(
         topBar = {
             TwTopBar(
                 title = if (isSender) "Sending Files" else "Receiving Files",
                 subtitle = if (hostIp == "0.0.0.0") "Remote WebRTC P2P" else "Nearby Wi-Fi Direct",
-                onBack = onNavigateBack
+                onBack = {
+                    if (progress.isCompleted) {
+                        terminateRemoteSessionIfLeaving()
+                    }
+                    onNavigateBack()
+                }
             )
         },
         containerColor = MaterialTheme.colorScheme.background
@@ -98,7 +119,10 @@ fun TransferScreen(
                         )
                     },
                     onRetry = { viewModel.retryTransfer() },
-                    onHome = onNavigateHome
+                    onHome = {
+                        terminateRemoteSessionIfLeaving()
+                        onNavigateHome()
+                    }
                 )
             } else {
                 ActiveTransferView(
@@ -312,7 +336,8 @@ private fun CompletedTransferView(
             .fillMaxSize()
             .padding(TwSpacing.Large)
             .navigationBarsPadding(),
-        horizontalAlignment = Alignment.CenterHorizontally
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = if (progress.transferredFiles.isEmpty()) Arrangement.Center else Arrangement.Top
     ) {
         Spacer(Modifier.height(TwSpacing.Default))
 
@@ -391,7 +416,7 @@ private fun CompletedTransferView(
                 }
             }
         } else {
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.height(TwSpacing.XLarge))
         }
 
         Spacer(Modifier.height(TwSpacing.Default))

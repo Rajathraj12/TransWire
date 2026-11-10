@@ -100,7 +100,9 @@ fun NavGraph(
                 SenderPairingScreen(
                     onNavigateBack       = { navController.popBackStack() },
                     onNavigateToTransfer = {
-                        navController.navigate(Screen.Transfer.createRoute(true, "0.0.0.0", true))
+                        navController.navigate(Screen.Transfer.createRoute(true, "0.0.0.0", true)) {
+                            popUpTo(Screen.Home.route) { inclusive = false }
+                        }
                     }
                 )
             }
@@ -110,7 +112,9 @@ fun NavGraph(
                     onNavigateBack       = { navController.popBackStack() },
                     onNavigateToNearby   = { navController.navigate(Screen.NearbyDiscovery.createRoute(false)) },
                     onNavigateToTransfer = {
-                        navController.navigate(Screen.Transfer.createRoute(false, "0.0.0.0", false))
+                        navController.navigate(Screen.Transfer.createRoute(false, "0.0.0.0", false)) {
+                            popUpTo(Screen.Home.route) { inclusive = false }
+                        }
                     }
                 )
             }

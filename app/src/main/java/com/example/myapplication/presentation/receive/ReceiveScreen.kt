@@ -99,7 +99,10 @@ fun ReceiveScreen(
                 is ReceiverState.Paired -> {
                     PairedSuccessView(
                         onStartTransfer = onNavigateToTransfer,
-                        onNavigateBack = onNavigateBack
+                        onCancel = {
+                            viewModel.cancelPairing()
+                            onNavigateBack()
+                        }
                     )
                 }
 
@@ -186,7 +189,7 @@ fun ReceiveScreen(
 @Composable
 private fun PairedSuccessView(
     onStartTransfer: () -> Unit,
-    onNavigateBack: () -> Unit
+    onCancel: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -229,7 +232,7 @@ private fun PairedSuccessView(
         Spacer(Modifier.height(10.dp))
         TwOutlinedButton(
             text = "Cancel",
-            onClick = onNavigateBack,
+            onClick = onCancel,
             modifier = Modifier.fillMaxWidth()
         )
     }
