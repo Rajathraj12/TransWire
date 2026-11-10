@@ -8,6 +8,7 @@ import com.example.myapplication.data.storage.FileStorageManager
 import com.example.myapplication.domain.model.*
 import com.example.myapplication.domain.transport.TransferTransport
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -20,11 +21,15 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.FileNotFoundException
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.net.SocketTimeoutException
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 class TransferManager(
     private val context: Context,
@@ -57,6 +62,11 @@ class TransferManager(
 
     private class NonRetryableTransferException(message: String, cause: Throwable? = null) : Exception(message, cause)
     private class TransferCancelledException(message: String = "Transfer cancelled") : Exception(message)
+
+    companion object {
+        private const val PEER_ACK_TIMEOUT_MS = 120_000L
+        private const val POST_COMPLETION_CLOSE_WAIT_MS = 5_000L
+    }
 
     suspend fun start(files: List<SelectedFile> = emptyList()) {
         try {
@@ -184,10 +194,17 @@ class TransferManager(
 
         val resumeMap = awaitResumeStateFromPeer()
 
+        val expectedFileIds = manifestFiles.map { it.fileId }.toSet()
+        val ackedFileIds = ConcurrentHashMap.newKeySet<String>()
+        val allAcksCompleted = CompletableDeferred<Unit>()
+        val lastControlActivityAt = AtomicLong(System.currentTimeMillis())
+
         val controlJob: Job = launch {
             while (isActive && !isCancelled) {
                 try {
-                    when (val ctrl = transport.readMessage()) {
+                    val ctrl = transport.readMessage()
+                    lastControlActivityAt.set(System.currentTimeMillis())
+                    when (ctrl) {
                         is TransferMessage.Pause -> {
                             isPaused = true
                             _progress.value = _progress.value.copy(isPaused = true)
@@ -196,14 +213,41 @@ class TransferManager(
                             isPaused = false
                             _progress.value = _progress.value.copy(isPaused = false)
                         }
+                        is TransferMessage.CompletionAck -> {
+                            if (ctrl.success) {
+                                synchronized(sessionFiles) {
+                                    sessionFiles[ctrl.fileId]?.let { existing ->
+                                        sessionFiles[ctrl.fileId] = existing.copy(status = "COMPLETED")
+                                    }
+                                }
+                                ackedFileIds.add(ctrl.fileId)
+                                if (ackedFileIds.size >= expectedFileIds.size && ackedFileIds.containsAll(expectedFileIds)) {
+                                    allAcksCompleted.complete(Unit)
+                                    break
+                                }
+                            } else {
+                                synchronized(sessionFiles) {
+                                    sessionFiles[ctrl.fileId]?.let { existing ->
+                                        sessionFiles[ctrl.fileId] = existing.copy(status = "FAILED")
+                                    }
+                                }
+                                val msg = ctrl.errorMessage ?: "Receiver failed verifying transferred file"
+                                peerErrorMessage = msg
+                                allAcksCompleted.completeExceptionally(Exception(msg))
+                                break
+                            }
+                        }
                         is TransferMessage.Cancel -> {
                             isCancelled = true
-                            peerErrorMessage = "Transfer cancelled by receiver"
+                            val err = TransferCancelledException("Transfer cancelled by receiver")
+                            peerErrorMessage = err.message
+                            allAcksCompleted.completeExceptionally(err)
                             transport.disconnect()
                             break
                         }
                         is TransferMessage.Error -> {
                             peerErrorMessage = ctrl.message
+                            allAcksCompleted.completeExceptionally(Exception(ctrl.message))
                             transport.disconnect()
                             break
                         }
@@ -211,7 +255,12 @@ class TransferManager(
                     }
                 } catch (_: SocketTimeoutException) {
                     // Normal when receiver has no control updates to send
-                } catch (_: Exception) {
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (!allAcksCompleted.isCompleted) {
+                        allAcksCompleted.completeExceptionally(e)
+                    }
                     break
                 }
             }
@@ -219,9 +268,9 @@ class TransferManager(
 
         try {
             var totalTransferred = manifestFiles.sumOf { manifest ->
-                val totalChunks = ChunkRangeTracker.computeTotalChunks(manifest.size, DEFAULT_CHUNK_SIZE)
                 val resumeInfo = resumeMap[manifest.fileId]
                 val chunkSize = resumeInfo?.chunkSize ?: DEFAULT_CHUNK_SIZE
+                val totalChunks = ChunkRangeTracker.computeTotalChunks(manifest.size, chunkSize)
                 val tracker = ChunkRangeTracker.parse(resumeInfo?.verifiedRanges, totalChunks)
                 tracker.verifiedBytes(manifest.size, chunkSize)
             }
@@ -235,6 +284,13 @@ class TransferManager(
 
                 val selectedFile = files[index]
                 activeFileId = fileInfo.fileId
+                synchronized(sessionFiles) {
+                    sessionFiles[fileInfo.fileId]?.let { existing ->
+                        if (existing.status == "PENDING") {
+                            sessionFiles[fileInfo.fileId] = existing.copy(status = "IN_PROGRESS")
+                        }
+                    }
+                }
                 val resumeInfo = resumeMap[fileInfo.fileId]
                 val chunkSize = resumeInfo?.chunkSize ?: DEFAULT_CHUNK_SIZE
                 val totalChunks = ChunkRangeTracker.computeTotalChunks(fileInfo.size, chunkSize)
@@ -298,14 +354,23 @@ class TransferManager(
 
                 val sha256 = digest.digest().joinToString("") { "%02x".format(it) }
                 transport.writeMessage(TransferMessage.Completion(fileInfo.fileId, sha256))
-                synchronized(sessionFiles) {
-                    sessionFiles[fileInfo.fileId]?.let { existing ->
-                        sessionFiles[fileInfo.fileId] = existing.copy(status = "COMPLETED")
-                    }
-                }
+                lastControlActivityAt.set(System.currentTimeMillis())
             }
 
             transport.flush()
+            lastControlActivityAt.set(System.currentTimeMillis())
+            while (!allAcksCompleted.isCompleted) {
+                if (isCancelled) throw TransferCancelledException()
+                peerErrorMessage?.let { throw Exception(it) }
+                if (!isPaused && System.currentTimeMillis() - lastControlActivityAt.get() > PEER_ACK_TIMEOUT_MS) {
+                    throw SocketTimeoutException("Timed out waiting for receiver to verify and confirm files")
+                }
+                withTimeoutOrNull(250L) {
+                    allAcksCompleted.await()
+                }
+            }
+            allAcksCompleted.await()
+
             _progress.value = _progress.value.copy(
                 isCompleted = true,
                 fileProgress = 1f,
@@ -313,8 +378,26 @@ class TransferManager(
                 canRetry = false,
                 transferredFiles = currentSessionFilesSnapshot()
             )
+        } catch (e: TransferCancelledException) {
+            markUnfinishedSessionFiles("CANCELLED")
+            throw e
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            markUnfinishedSessionFiles(if (isCancelled) "CANCELLED" else "INTERRUPTED")
+            throw e
         } finally {
             controlJob.cancel()
+        }
+    }
+
+    private fun markUnfinishedSessionFiles(targetStatus: String) {
+        synchronized(sessionFiles) {
+            sessionFiles.forEach { (fileId, existing) ->
+                if (existing.status == "PENDING" || existing.status == "IN_PROGRESS") {
+                    sessionFiles[fileId] = existing.copy(status = targetStatus)
+                }
+            }
         }
     }
 
@@ -373,6 +456,7 @@ class TransferManager(
         val tempFiles = mutableMapOf<String, File>()
         val randomAccessFiles = mutableMapOf<String, RandomAccessFile>()
         val newlyCreatedTempIds = mutableSetOf<String>()
+        var notifiedSenderError = false
 
         synchronized(sessionFiles) {
             sessionFiles.clear()
@@ -481,6 +565,8 @@ class TransferManager(
             var lastPersistAt = System.currentTimeMillis()
 
             var completedFiles = 0
+            var firstFailureMessage: String? = null
+            val completedFileIds = HashSet<String>()
             while (completedFiles < sanitizedManifest.size) {
                 if (isCancelled) throw TransferCancelledException()
 
@@ -539,6 +625,9 @@ class TransferManager(
                         )
                     }
                     is TransferMessage.Completion -> {
+                        if (!completedFileIds.add(msg.fileId)) {
+                            continue
+                        }
                         val fileInfo = activeFiles[msg.fileId]
                         val tracker = trackers[msg.fileId]
                         val tempFile = tempFiles[msg.fileId]
@@ -548,15 +637,23 @@ class TransferManager(
 
                         if (fileInfo != null && tracker != null && tempFile != null) {
                             if (!tracker.isComplete()) {
+                                val errMsg = "Incomplete file received for \"${fileInfo.name}\" (${tracker.verifiedCount()}/${tracker.totalChunks} chunks)"
+                                notifiedSenderError = true
+                                runCatching { transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, false, errMsg)) }
+                                runCatching { transport.flush() }
                                 persistInterruptedState(activeFiles, trackers)
-                                throw Exception("Incomplete file received for \"${fileInfo.name}\" (${tracker.verifiedCount()}/${tracker.totalChunks} chunks)")
+                                throw Exception(errMsg)
                             }
 
                             val calculatedSha = fileStorageManager.computeFileSha256(tempFile)
                             if (calculatedSha.equals(msg.sha256, ignoreCase = true)) {
                                 if (!fileStorageManager.hasSufficientStorage(fileInfo.size)) {
+                                    val errMsg = "Insufficient storage space to save \"${fileInfo.name}\"."
                                     dao.updateFailure(msg.fileId, "FAILED", "Insufficient storage saving file")
-                                    throw Exception("Insufficient storage space to save \"${fileInfo.name}\".")
+                                    notifiedSenderError = true
+                                    runCatching { transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, false, errMsg)) }
+                                    runCatching { transport.flush() }
+                                    throw Exception(errMsg)
                                 }
                                 val savedUri = fileStorageManager.saveToDownloads(tempFile, fileInfo.name, fileInfo.mimeType)
                                 val uriString = savedUri?.toString()
@@ -581,6 +678,14 @@ class TransferManager(
                                         fileUri = uriString
                                     )
                                 }
+                                if (finalStatus == "COMPLETED") {
+                                    transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, true))
+                                } else {
+                                    val errMsg = "Failed to save \"${fileInfo.name}\" to Downloads"
+                                    if (firstFailureMessage == null) firstFailureMessage = errMsg
+                                    notifiedSenderError = true
+                                    runCatching { transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, false, errMsg)) }
+                                }
                             } else {
                                 // Corrupted file: purge temp file and reset ranges so retry fetches clean data
                                 fileStorageManager.deleteTempFile(tempFile)
@@ -591,6 +696,10 @@ class TransferManager(
                                         sessionFiles[msg.fileId] = existing.copy(status = "FAILED")
                                     }
                                 }
+                                val errMsg = "SHA-256 verification failed for \"${fileInfo.name}\""
+                                if (firstFailureMessage == null) firstFailureMessage = errMsg
+                                notifiedSenderError = true
+                                runCatching { transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, false, errMsg)) }
                             }
                         }
                         completedFiles++
@@ -611,19 +720,24 @@ class TransferManager(
                         isCancelled = true
                         throw TransferCancelledException("Transfer cancelled by sender")
                     }
-                    is TransferMessage.Manifest, is TransferMessage.ResumeState -> {
-                        // Ignore duplicate handshake frames mid-stream
+                    is TransferMessage.Manifest, is TransferMessage.ResumeState, is TransferMessage.CompletionAck -> {
+                        // Ignore duplicate handshake or sender-bound ack frames mid-stream
                     }
                 }
             }
 
+            transport.flush()
             _progress.value = _progress.value.copy(
+                error = firstFailureMessage,
                 isCompleted = true,
-                fileProgress = 1f,
+                fileProgress = if (firstFailureMessage == null) 1f else _progress.value.fileProgress,
                 isPaused = false,
-                canRetry = false,
+                canRetry = firstFailureMessage != null,
                 transferredFiles = currentSessionFilesSnapshot()
             )
+            if (!isCancelled) {
+                transport.awaitRemoteClose(POST_COMPLETION_CLOSE_WAIT_MS)
+            }
         } catch (e: TransferCancelledException) {
             randomAccessFiles.values.forEach { runCatching { it.close() } }
             randomAccessFiles.clear()
@@ -643,6 +757,10 @@ class TransferManager(
             }
             randomAccessFiles.clear()
             persistInterruptedState(activeFiles, trackers)
+            if (!notifiedSenderError && !isCancelled && e !is IOException && e.message?.startsWith("Peer error:") != true) {
+                runCatching { transport.writeMessage(TransferMessage.Error(e.message ?: "Receiver interrupted")) }
+                runCatching { transport.flush() }
+            }
             throw e
         } finally {
             randomAccessFiles.values.forEach { runCatching { it.close() } }

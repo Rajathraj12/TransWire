@@ -104,6 +104,15 @@ object MessageSerializer {
                     out.writeInt(it.chunkSize)
                 }
             }
+            is TransferMessage.CompletionAck -> {
+                validateFileId(message.fileId)
+                val err = message.errorMessage ?: ""
+                require(err.length <= MAX_ERROR_MESSAGE_LENGTH) { "Ack error message too long" }
+                out.writeInt(9)
+                out.writeUTF(message.fileId)
+                out.writeBoolean(message.success)
+                out.writeUTF(err)
+            }
         }
     }
 
@@ -213,6 +222,19 @@ object MessageSerializer {
                     items.add(FileResumeInfo(fileId, verifiedRanges, chunkSize))
                 }
                 TransferMessage.ResumeState(items)
+            }
+            9 -> {
+                val fileId = readValidatedFileId(input)
+                val success = input.readBoolean()
+                val err = input.readUTF()
+                if (err.length > MAX_ERROR_MESSAGE_LENGTH) {
+                    throw IOException("Oversized ack error message")
+                }
+                TransferMessage.CompletionAck(
+                    fileId = fileId,
+                    success = success,
+                    errorMessage = err.takeIf { it.isNotEmpty() }
+                )
             }
             else -> throw IOException("Unknown message type: $type")
         }

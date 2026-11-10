@@ -108,6 +108,18 @@ class TcpTransferTransport : TransferTransport {
         }
     }
 
+    override suspend fun awaitRemoteClose(timeoutMs: Long) = withContext(Dispatchers.IO) {
+        val activeSocket = socket ?: return@withContext
+        val input = dataIn ?: return@withContext
+        runCatching {
+            activeSocket.soTimeout = timeoutMs.toInt().coerceIn(500, SOCKET_READ_TIMEOUT_MS)
+            while (!disconnected) {
+                MessageSerializer.readMessage(input)
+            }
+        }
+        Unit
+    }
+
     override fun disconnect() {
         disconnected = true
         try { dataIn?.close() } catch (_: Exception) {}

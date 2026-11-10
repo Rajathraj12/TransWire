@@ -39,6 +39,9 @@ class WebRtcTransferTransport(
     @Volatile
     private var closedReason: Throwable? = null
 
+    @Volatile
+    private var locallyDisconnected = false
+
     companion object {
         private const val CONNECT_TIMEOUT_MS = 45_000L
         private const val READ_TIMEOUT_MS = 30_000L
@@ -174,6 +177,7 @@ class WebRtcTransferTransport(
 
     override suspend fun initAsServer(port: Int) {
         initFactory()
+        locallyDisconnected = false
         closedReason = null
         remoteDescriptionSet = false
         synchronized(iceLock) { pendingRemoteIceCandidates.clear() }
@@ -238,9 +242,11 @@ class WebRtcTransferTransport(
                     handleRemoteIceCandidate(ice)
                 }
                 is SignalingEvent.PeerDisconnected -> {
-                    val err = IOException("Receiver disconnected from signaling session")
-                    dcDeferred.completeExceptionally(err)
-                    failChannel(err)
+                    if (!dcDeferred.isCompleted) {
+                        val err = IOException("Receiver disconnected from signaling session")
+                        dcDeferred.completeExceptionally(err)
+                        failChannel(err)
+                    }
                 }
                 else -> {}
             }
@@ -248,11 +254,18 @@ class WebRtcTransferTransport(
 
         val buffered = SignalingClient.drainBufferedWebRtcSignals()
         signalingJob = scope.launch {
-            for (event in buffered) {
-                processServerSignal(event)
-            }
-            SignalingClient.events.collect { event ->
-                processServerSignal(event)
+            try {
+                for (event in buffered) {
+                    processServerSignal(event)
+                }
+                SignalingClient.events.collect { event ->
+                    processServerSignal(event)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                dcDeferred.completeExceptionally(e)
+                failChannel(e)
             }
         }
 
@@ -273,6 +286,7 @@ class WebRtcTransferTransport(
 
     override suspend fun initAsClient(host: String, port: Int) {
         initFactory()
+        locallyDisconnected = false
         closedReason = null
         remoteDescriptionSet = false
         synchronized(iceLock) { pendingRemoteIceCandidates.clear() }
@@ -342,9 +356,11 @@ class WebRtcTransferTransport(
                     handleRemoteIceCandidate(ice)
                 }
                 is SignalingEvent.PeerDisconnected -> {
-                    val err = IOException("Sender disconnected from signaling session")
-                    dcDeferred.completeExceptionally(err)
-                    failChannel(err)
+                    if (!dcDeferred.isCompleted) {
+                        val err = IOException("Sender disconnected from signaling session")
+                        dcDeferred.completeExceptionally(err)
+                        failChannel(err)
+                    }
                 }
                 else -> {}
             }
@@ -353,11 +369,18 @@ class WebRtcTransferTransport(
         // Process buffered offer & early ICE candidates emitted while user tapped Start Receiving
         val buffered = SignalingClient.drainBufferedWebRtcSignals()
         signalingJob = scope.launch {
-            for (event in buffered) {
-                processClientSignal(event)
-            }
-            SignalingClient.events.collect { event ->
-                processClientSignal(event)
+            try {
+                for (event in buffered) {
+                    processClientSignal(event)
+                }
+                SignalingClient.events.collect { event ->
+                    processClientSignal(event)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                dcDeferred.completeExceptionally(e)
+                failChannel(e)
             }
         }
 
@@ -401,6 +424,10 @@ class WebRtcTransferTransport(
     }
 
     override suspend fun readMessage(): TransferMessage {
+        if (locallyDisconnected) {
+            throw (closedReason ?: IOException("Transfer disconnected"))
+        }
+        messageChannel.tryReceive().getOrNull()?.let { return it }
         closedReason?.let { throw it }
         return try {
             withTimeout(READ_TIMEOUT_MS) {
@@ -415,14 +442,36 @@ class WebRtcTransferTransport(
 
     override suspend fun flush() {
         val dc = dataChannel ?: return
-        val deadline = System.currentTimeMillis() + 5_000L
-        while (dc.state() == DataChannel.State.OPEN && dc.bufferedAmount() > 0L && System.currentTimeMillis() < deadline) {
+        val deadline = System.currentTimeMillis() + 20_000L
+        while (
+            !locallyDisconnected &&
+            closedReason == null &&
+            dc.state() == DataChannel.State.OPEN &&
+            dc.bufferedAmount() > 0L &&
+            System.currentTimeMillis() < deadline
+        ) {
             delay(25)
         }
-        delay(50)
+        if (!locallyDisconnected && closedReason == null && dc.state() == DataChannel.State.OPEN) {
+            delay(25)
+        }
+    }
+
+    override suspend fun awaitRemoteClose(timeoutMs: Long) {
+        if (locallyDisconnected || closedReason != null) return
+        withTimeoutOrNull(timeoutMs) {
+            try {
+                while (!locallyDisconnected && closedReason == null) {
+                    messageChannel.receive()
+                }
+            } catch (_: Exception) {
+                // Expected once peer disconnects after receiving CompletionAck
+            }
+        }
     }
 
     override fun disconnect() {
+        locallyDisconnected = true
         failChannel(IOException("Transfer disconnected"))
         signalingJob?.cancel()
         scope.cancel()

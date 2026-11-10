@@ -76,6 +76,14 @@ class Phase8ReliabilitySecurityTest {
         )
         val decodedManifest = MessageSerializer.deserialize(MessageSerializer.serialize(manifest))
         assertEquals(manifest, decodedManifest)
+
+        val ackOk = TransferMessage.CompletionAck("file_123", success = true)
+        val decodedAckOk = MessageSerializer.deserialize(MessageSerializer.serialize(ackOk))
+        assertEquals(ackOk, decodedAckOk)
+
+        val ackErr = TransferMessage.CompletionAck("file_123", success = false, errorMessage = "SHA-256 verification failed")
+        val decodedAckErr = MessageSerializer.deserialize(MessageSerializer.serialize(ackErr))
+        assertEquals(ackErr, decodedAckErr)
     }
 
     @Test(expected = IOException::class)

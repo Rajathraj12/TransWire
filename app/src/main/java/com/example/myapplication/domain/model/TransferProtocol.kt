@@ -1,6 +1,6 @@
 package com.example.myapplication.domain.model
 
-const val DEFAULT_CHUNK_SIZE = 64 * 1024
+const val DEFAULT_CHUNK_SIZE = 32 * 1024
 
 data class FileManifest(
     val fileId: String,
@@ -19,6 +19,7 @@ sealed class TransferMessage {
     data class Manifest(val version: Int, val files: List<FileManifest>) : TransferMessage()
     data class Chunk(val fileId: String, val chunkIndex: Int, val length: Int, val payload: ByteArray) : TransferMessage()
     data class Completion(val fileId: String, val sha256: String) : TransferMessage()
+    data class CompletionAck(val fileId: String, val success: Boolean, val errorMessage: String? = null) : TransferMessage()
     data class Error(val message: String) : TransferMessage()
     data class Pause(val fileId: String) : TransferMessage()
     data class Resume(val fileId: String, val chunkIndex: Int) : TransferMessage()
