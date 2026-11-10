@@ -47,6 +47,8 @@ fun SenderPairingScreen(
     val qrCodeBitmap by viewModel.qrCodeBitmap.collectAsState()
     val timeRemaining by viewModel.timeRemainingSeconds.collectAsState()
     val joinRequestReceiverId by viewModel.joinRequestReceiverId.collectAsState()
+    val isSessionReady by viewModel.isSessionReady.collectAsState()
+    val connectionError by viewModel.connectionError.collectAsState()
     val context = LocalContext.current
 
     LaunchedEffect(session?.status) {
@@ -99,7 +101,10 @@ fun SenderPairingScreen(
                     QrPinPassTicket(
                         qrCodeBitmap = qrCodeBitmap,
                         pin = session?.pin ?: "------",
-                        timeRemaining = timeRemaining
+                        timeRemaining = timeRemaining,
+                        isSessionReady = isSessionReady,
+                        connectionError = connectionError,
+                        onRetryConnection = { viewModel.retryConnection() }
                     )
                 }
             }
@@ -264,7 +269,10 @@ private fun IncomingJoinRequestCard(
 private fun QrPinPassTicket(
     qrCodeBitmap: android.graphics.Bitmap?,
     pin: String,
-    timeRemaining: Long
+    timeRemaining: Long,
+    isSessionReady: Boolean,
+    connectionError: String?,
+    onRetryConnection: () -> Unit
 ) {
     val expiryFraction = (timeRemaining / 120f).coerceIn(0f, 1f)
     val primaryColor = MaterialTheme.colorScheme.primary
@@ -483,10 +491,23 @@ private fun QrPinPassTicket(
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = "Waiting for receiver…",
+                        text = when {
+                            connectionError != null && !isSessionReady -> connectionError
+                            !isSessionReady -> "Registering code with server…"
+                            else -> "Waiting for receiver…"
+                        },
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = if (connectionError != null && !isSessionReady) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        }
                     )
+                }
+                if (connectionError != null && !isSessionReady) {
+                    TextButton(onClick = onRetryConnection) {
+                        Text("Retry", color = MaterialTheme.colorScheme.primary)
+                    }
                 }
             }
         }

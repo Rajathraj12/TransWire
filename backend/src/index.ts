@@ -71,9 +71,16 @@ app.get('/turn-credentials', turnLimiter, (req, res) => {
     }
   }
 
-  // Use environment variables or local fallback for testing
   const turnSecret = process.env.TURN_SHARED_SECRET || 'dev-secret';
-  const turnServer = process.env.TURN_SERVER_URL || 'turn:10.0.2.2:3478';
+  const turnServer = process.env.TURN_SERVER_URL || '';
+  if (!turnServer) {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({
+      uris: [],
+      username: '',
+      password: ''
+    });
+  }
   if (process.env.NODE_ENV === 'production' && turnSecret === 'dev-secret') {
     console.warn('[TURN] WARNING: Using default TURN_SHARED_SECRET in production');
   }

@@ -15,15 +15,21 @@ import java.net.URL
 object SignalingClient {
     private var socket: Socket? = null
 
-    const val DEFAULT_SERVER_URL = "http://172.21.2.57:3000"
+    const val DEFAULT_SERVER_URL = "https://transwire-lwbl.onrender.com"
+    const val LOCAL_SERVER_URL = "http://172.21.2.57:3000"
     const val EMULATOR_SERVER_URL = "http://10.0.2.2:3000"
 
-    // For local emulator testing: "http://10.0.2.2:3000"
-    // For physical device testing, use the LAN IP of the PC running Node.js or a public HTTPS tunnel URL
+    // Defaults to the hosted Render signaling server; overridable in Settings for local testing
     @Volatile
     var serverUrl = DEFAULT_SERVER_URL
 
     var activeSessionId: String? = null
+
+    @Volatile
+    private var pendingCreatePayload: JSONObject? = null
+
+    @Volatile
+    private var pendingJoinPayload: JSONObject? = null
     
     private val _events = kotlinx.coroutines.flow.MutableSharedFlow<SignalingEvent>(
         replay = 50, 
@@ -57,8 +63,8 @@ object SignalingClient {
             val url = URL("$base/health")
             conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 3500
-                readTimeout = 3500
+                connectTimeout = 30_000
+                readTimeout = 30_000
             }
             val code = conn.responseCode
             if (code == 200) {
@@ -78,11 +84,24 @@ object SignalingClient {
         try {
             socket?.off()
             socket?.disconnect()
-            socket = IO.socket(serverUrl)
+            val options = IO.Options().apply {
+                timeout = 30_000L
+                reconnection = true
+                reconnectionAttempts = 5
+                reconnectionDelay = 1_500L
+            }
+            socket = IO.socket(serverUrl, options)
             
             socket?.on(Socket.EVENT_CONNECT) {
                 Log.d("SignalingClient", "Connected to signaling server")
                 _events.tryEmit(SignalingEvent.Connected)
+                pendingCreatePayload?.let { payload ->
+                    emitCreateSession(payload)
+                }
+                pendingJoinPayload?.let { payload ->
+                    pendingJoinPayload = null
+                    emitJoinSession(payload)
+                }
             }
             
             socket?.on(Socket.EVENT_CONNECT_ERROR) { args ->
@@ -100,6 +119,8 @@ object SignalingClient {
             }
             
             socket?.on("peer-joined") {
+                pendingCreatePayload = null
+                pendingJoinPayload = null
                 _events.tryEmit(SignalingEvent.PeerJoined)
             }
             
@@ -153,9 +174,22 @@ object SignalingClient {
             put("pairingToken", token)
             put("pin", pin)
         }
+        pendingCreatePayload = data
+        if (socket?.connected() == true) {
+            emitCreateSession(data)
+        } else {
+            connect()
+        }
+    }
+
+    private fun emitCreateSession(data: JSONObject) {
+        val sessionId = data.optString("sessionId")
         socket?.emit("create-session", data, io.socket.client.Ack { args ->
             val response = args.firstOrNull() as? JSONObject ?: return@Ack
-            if (!response.optBoolean("success", true)) {
+            if (response.optBoolean("success", false)) {
+                _events.tryEmit(SignalingEvent.SessionCreated(sessionId))
+            } else {
+                pendingCreatePayload = null
                 _events.tryEmit(SignalingEvent.JoinError(response.optString("error", "Failed to create session")))
             }
         })
@@ -165,21 +199,28 @@ object SignalingClient {
         val data = JSONObject().apply {
             put("pin", pin)
         }
-        socket?.emit("join-session", data, io.socket.client.Ack { args ->
-            val response = args.firstOrNull() as? JSONObject ?: return@Ack
-            if (response.optBoolean("success")) {
-                activeSessionId = response.optString("sessionId").takeIf { it.isNotEmpty() }
-            } else {
-                _events.tryEmit(SignalingEvent.JoinError(response.optString("error", "Invalid or expired PIN")))
-            }
-        })
+        if (socket?.connected() == true) {
+            emitJoinSession(data)
+        } else {
+            pendingJoinPayload = data
+            connect()
+        }
     }
-    
+
     fun joinSessionWithQr(sessionId: String, token: String) {
         val data = JSONObject().apply {
             put("sessionId", sessionId)
             put("pairingToken", token)
         }
+        if (socket?.connected() == true) {
+            emitJoinSession(data)
+        } else {
+            pendingJoinPayload = data
+            connect()
+        }
+    }
+
+    private fun emitJoinSession(data: JSONObject) {
         socket?.emit("join-session", data, io.socket.client.Ack { args ->
             val response = args.firstOrNull() as? JSONObject ?: return@Ack
             if (response.optBoolean("success")) {
@@ -192,6 +233,10 @@ object SignalingClient {
 
     fun leaveSession(sessionId: String? = activeSessionId) {
         val sid = sessionId ?: return
+        if (pendingCreatePayload?.optString("sessionId") == sid) {
+            pendingCreatePayload = null
+        }
+        pendingJoinPayload = null
         val data = JSONObject().apply {
             put("sessionId", sid)
         }
@@ -256,8 +301,8 @@ object SignalingClient {
             val url = URL("$serverUrl/turn-credentials$querySuffix")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "GET"
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
+            conn.connectTimeout = 15_000
+            conn.readTimeout = 15_000
             activeSessionId?.let { conn.setRequestProperty("X-Session-Id", it) }
             
             if (conn.responseCode == 200) {
@@ -288,6 +333,8 @@ object SignalingClient {
 
     fun disconnect() {
         activeSessionId = null
+        pendingCreatePayload = null
+        pendingJoinPayload = null
         socket?.off()
         socket?.disconnect()
         socket = null
@@ -300,6 +347,7 @@ object SignalingClient {
 
 sealed class SignalingEvent {
     object Connected : SignalingEvent()
+    data class SessionCreated(val sessionId: String) : SignalingEvent()
     data class ConnectionError(val message: String) : SignalingEvent()
     data class JoinRequest(val receiverId: String) : SignalingEvent()
     data class JoinError(val message: String) : SignalingEvent()

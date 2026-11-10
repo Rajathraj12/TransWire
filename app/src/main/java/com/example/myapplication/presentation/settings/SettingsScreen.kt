@@ -385,6 +385,14 @@ private fun RemoteServerSection(context: Context) {
                         draftUrl = SignalingClient.DEFAULT_SERVER_URL
                         statusMessage = null
                     },
+                    label = { Text("Cloud", style = MaterialTheme.typography.labelSmall) },
+                    shape = ShapePill
+                )
+                AssistChip(
+                    onClick = {
+                        draftUrl = SignalingClient.LOCAL_SERVER_URL
+                        statusMessage = null
+                    },
                     label = { Text("Local PC", style = MaterialTheme.typography.labelSmall) },
                     shape = ShapePill
                 )
@@ -451,8 +459,10 @@ private fun RemoteServerSection(context: Context) {
                 TwPrimaryButton(
                     text = "Save URL",
                     onClick = {
-                        if (SignalingClient.updateServerUrl(draftUrl)) {
-                            ServerPreferences.setServerUrl(context, draftUrl)
+                        val cleaned = draftUrl.trim().trimEnd('/')
+                        if (SignalingClient.updateServerUrl(cleaned)) {
+                            draftUrl = cleaned
+                            ServerPreferences.setServerUrl(context, cleaned)
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             statusMessage = true to "Saved. Remote transfers will use this server."
                         } else {

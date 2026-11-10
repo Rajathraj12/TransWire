@@ -14,26 +14,37 @@ class SessionManager {
   private sessions = new Map<string, Session>();
   private pinToSessionId = new Map<string, string>();
 
-  createSession(session: Session): boolean {
+  createSession(session: Session): 'created' | 'rebound' | 'rejected' {
     this.cleanupExpiredSessions();
     if (this.sessions.size >= MAX_ACTIVE_SESSIONS) {
-      return false;
+      return 'rejected';
     }
 
-    // Ensure one active pending session per sender socket
-    for (const [existingId, existing] of this.sessions.entries()) {
-      if (existing.senderSocketId === session.senderSocketId && existing.status !== 'PAIRED') {
+    const existing = this.sessions.get(session.sessionId);
+    if (existing) {
+      // Allow the same sender to re-bind its new socketId after brief backgrounding/reconnect
+      if (
+        existing.status !== 'PAIRED' &&
+        timingSafeStringEqual(existing.pairingToken, session.pairingToken) &&
+        existing.pin === session.pin
+      ) {
+        existing.senderSocketId = session.senderSocketId;
+        existing.lastActivityAt = Date.now();
+        return 'rebound';
+      }
+      return 'rejected';
+    }
+
+    // Ensure one active non-paired session per sender socket
+    for (const [existingId, item] of this.sessions.entries()) {
+      if (item.senderSocketId === session.senderSocketId && item.status !== 'PAIRED') {
         this.removeSession(existingId);
       }
     }
 
-    if (this.sessions.has(session.sessionId)) {
-      return false;
-    }
-
     this.sessions.set(session.sessionId, session);
     this.pinToSessionId.set(session.pin, session.sessionId);
-    return true;
+    return 'created';
   }
 
   getSessionById(sessionId: string): Session | undefined {

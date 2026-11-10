@@ -98,7 +98,7 @@ export function setupSocketHandlers(io: Server) {
       try {
         const parsed = createSessionSchema.parse(data);
         const now = Date.now();
-        const created = sessionManager.createSession({
+        const result = sessionManager.createSession({
           sessionId: parsed.sessionId,
           pairingToken: parsed.pairingToken,
           pin: parsed.pin,
@@ -109,13 +109,20 @@ export function setupSocketHandlers(io: Server) {
           lastActivityAt: now
         });
 
-        if (!created) {
+        if (result === 'rejected') {
           return callback?.({ success: false, error: 'Unable to create session' });
         }
 
         socket.join(parsed.sessionId);
-        console.log(`[Session] Created ${parsed.sessionId} by ${socket.id}`);
-        callback?.({ success: true });
+        console.log(`[Session] ${result === 'rebound' ? 'Rebound' : 'Created'} ${parsed.sessionId} by ${socket.id}`);
+
+        // If a receiver requested to join while the sender briefly reconnected (e.g., sharing QR), notify now
+        const activeSession = sessionManager.getSessionById(parsed.sessionId);
+        if (result === 'rebound' && activeSession?.status === 'WAITING_APPROVAL' && activeSession.receiverSocketId) {
+          socket.emit('join-request', { receiverId: activeSession.receiverSocketId });
+        }
+
+        callback?.({ success: true, sessionId: parsed.sessionId });
       } catch {
         callback?.({ success: false, error: 'Invalid data' });
       }
@@ -292,9 +299,23 @@ export function setupSocketHandlers(io: Server) {
     socket.on('disconnect', () => {
       console.log(`[Socket] Disconnected: ${socket.id}`);
       sessionManager.getAllSessions().forEach((session) => {
-        if (session.senderSocketId === socket.id || session.receiverSocketId === socket.id) {
-          socket.to(session.sessionId).emit('peer-disconnected');
-          sessionManager.removeSession(session.sessionId);
+        if (session.senderSocketId === socket.id) {
+          if (session.status === 'PAIRED') {
+            socket.to(session.sessionId).emit('peer-disconnected');
+            sessionManager.removeSession(session.sessionId);
+          }
+          // Keep PENDING / WAITING_APPROVAL sessions alive until expiresAt so brief app switches
+          // (e.g. sharing QR/PIN to WhatsApp) or mobile network reconnects do not invalidate the QR.
+        } else if (session.receiverSocketId === socket.id) {
+          if (session.status === 'PAIRED') {
+            socket.to(session.sessionId).emit('peer-disconnected');
+            sessionManager.removeSession(session.sessionId);
+          } else if (session.status === 'WAITING_APPROVAL') {
+            sessionManager.updateSession(session.sessionId, {
+              status: 'PENDING',
+              receiverSocketId: undefined
+            });
+          }
         }
       });
     });
