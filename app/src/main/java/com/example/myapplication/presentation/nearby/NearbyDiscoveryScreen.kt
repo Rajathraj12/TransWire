@@ -5,32 +5,36 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.*
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.myapplication.presentation.components.*
+import com.example.myapplication.presentation.theme.*
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NearbyDiscoveryScreen(
     isSender: Boolean,
@@ -39,12 +43,15 @@ fun NearbyDiscoveryScreen(
     viewModel: NearbyDiscoveryViewModel = viewModel()
 ) {
     val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     val isDiscovering by viewModel.isDiscovering.collectAsState()
     val peers by viewModel.peers.collectAsState()
     val connectionInfo by viewModel.connectionInfo.collectAsState()
     val thisDeviceName by viewModel.thisDeviceName.collectAsState()
     val error by viewModel.error.collectAsState()
+
     var hasAutoStartedSender by remember { mutableStateOf(false) }
+    var connectingAddress by remember { mutableStateOf<String?>(null) }
 
     val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
@@ -77,65 +84,60 @@ fun NearbyDiscoveryScreen(
         }
     }
 
-    // Sender automatically enters transfer screen once Wi-Fi Direct group forms and waits for receiver acceptance
+    LaunchedEffect(error) {
+        if (error != null) {
+            connectingAddress = null
+        }
+    }
+
+    // Sender auto-enters TransferScreen once Wi-Fi Direct group forms and waits for receiver acceptance
     LaunchedEffect(isSender, connectionInfo) {
         val info = connectionInfo
         if (isSender && !hasAutoStartedSender && info != null && info.groupFormed && info.groupOwnerAddress != null) {
             hasAutoStartedSender = true
-            val ip = info.groupOwnerAddress?.hostAddress ?: ""
-            onNavigateToTransfer(ip, info.isGroupOwner)
+            onNavigateToTransfer(info.groupOwnerAddress?.hostAddress ?: "", info.isGroupOwner)
         }
     }
 
     DisposableEffect(Unit) {
-        onDispose {
-            viewModel.stopDiscovery()
-        }
+        onDispose { viewModel.stopDiscovery() }
     }
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text(if (isSender) "Find Receiver Nearby" else "Receive Nearby") },
-                navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
+            TwTopBar(
+                title = if (isSender) "Find Receiver Nearby" else "Receive Nearby",
+                subtitle = if (isSender) "Wi-Fi Direct offline discovery" else "Discoverable standby",
+                onBack = onNavigateBack,
                 actions = {
-                    if (hasPermissions && !isDiscovering && connectionInfo == null) {
+                    if (isSender && hasPermissions && !isDiscovering && connectionInfo == null) {
                         IconButton(onClick = { viewModel.startDiscovery() }) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Refresh")
+                            Icon(Icons.Default.Refresh, contentDescription = "Scan again")
                         }
                     }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimary,
-                    navigationIconContentColor = MaterialTheme.colorScheme.onPrimary,
-                    actionIconContentColor = MaterialTheme.colorScheme.onPrimary
-                )
+                }
             )
-        }
-    ) { paddingValues ->
-        Column(
+        },
+        containerColor = MaterialTheme.colorScheme.background
+    ) { padding ->
+        Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(paddingValues)
+                .padding(padding)
         ) {
             if (!hasPermissions) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            text = "Location/Nearby permissions are required\nfor Wi-Fi Direct transfer.",
-                            style = MaterialTheme.typography.bodyLarge,
-                            textAlign = TextAlign.Center
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Button(onClick = { permissionLauncher.launch(requiredPermissions) }) {
-                            Text("Grant Permissions")
-                        }
-                    }
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(TwSpacing.Large),
+                    contentAlignment = Alignment.Center
+                ) {
+                    TwEmptyState(
+                        title = "Nearby Permission Required",
+                        subtitle = "TransWire needs Wi-Fi Direct / Location permission to discover nearby devices offline.",
+                        icon = Icons.Default.WifiOff,
+                        action = "Grant Permissions" to { permissionLauncher.launch(requiredPermissions) }
+                    )
                 }
                 return@Scaffold
             }
@@ -143,185 +145,74 @@ fun NearbyDiscoveryScreen(
             if (connectionInfo != null && connectionInfo!!.groupFormed) {
                 val info = connectionInfo!!
                 val ip = info.groupOwnerAddress?.hostAddress ?: ""
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Wifi,
-                        contentDescription = "Connected",
-                        modifier = Modifier.size(72.dp),
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = if (isSender) "Connected to Receiver" else "Incoming Nearby Transfer",
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Center
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = if (isSender) {
-                            "Ready to send files.\nWaiting for receiver to accept."
-                        } else {
-                            "A nearby sender wants to send files to this device.\nAccept to begin receiving."
-                        },
-                        style = MaterialTheme.typography.bodyLarge,
-                        textAlign = TextAlign.Center,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(32.dp))
-
-                    Button(
-                        onClick = { onNavigateToTransfer(ip, info.isGroupOwner) },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(56.dp)
-                    ) {
-                        Text(if (isSender) "Start Sending" else "Accept & Receive Files")
+                NearbyConnectedView(
+                    isSender = isSender,
+                    onConfirm = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onNavigateToTransfer(ip, info.isGroupOwner)
+                    },
+                    onDecline = {
+                        hasAutoStartedSender = false
+                        connectingAddress = null
+                        viewModel.disconnect()
+                        viewModel.startDiscovery()
                     }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-                    OutlinedButton(
-                        onClick = {
-                            hasAutoStartedSender = false
-                            viewModel.disconnect()
-                            viewModel.startDiscovery()
-                        },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
-                    ) {
-                        Text(if (isSender) "Disconnect" else "Decline")
-                    }
-                }
+                )
                 return@Scaffold
             }
 
-            error?.let {
-                Surface(
-                    color = MaterialTheme.colorScheme.errorContainer,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = it,
-                        modifier = Modifier.padding(16.dp),
-                        color = MaterialTheme.colorScheme.onErrorContainer
-                    )
-                }
-            }
-
-            if (isSender) {
-                // Sender-only discovery: search for nearby receivers and connect
-                if (isDiscovering) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(200.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        RadarAnimation()
-                    }
-                    Text(
-                        text = "Searching for nearby receivers...",
-                        modifier = Modifier.fillMaxWidth(),
-                        textAlign = TextAlign.Center,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                } else if (peers.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                            .padding(24.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(
-                                text = "No nearby receivers found.",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "Ask the receiver to open Receive > Nearby Transfer.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                textAlign = TextAlign.Center,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Button(onClick = { viewModel.startDiscovery() }) {
-                                Text("Scan Again")
-                            }
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                LazyColumn(
-                    modifier = Modifier.weight(1f)
-                ) {
-                    items(peers, key = { it.deviceAddress }) { peer ->
-                        ListItem(
-                            headlineContent = { Text(peer.deviceName.ifBlank { "Nearby Device" }, fontWeight = FontWeight.Bold) },
-                            supportingContent = { Text("Tap to send files • ${peer.deviceAddress}") },
-                            leadingContent = {
+            Column(modifier = Modifier.fillMaxSize()) {
+                AnimatedVisibility(visible = error != null, enter = fadeIn(), exit = fadeOut()) {
+                    error?.let { msg ->
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(TwSpacing.Default),
+                            shape = ShapeDefault,
+                            color = MaterialTheme.colorScheme.errorContainer
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(TwSpacing.Default),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Icon(
-                                    imageVector = Icons.Default.PhoneAndroid,
-                                    contentDescription = "Receiver Device",
-                                    tint = MaterialTheme.colorScheme.primary
+                                    Icons.Default.ErrorOutline,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(18.dp)
                                 )
-                            },
-                            modifier = Modifier.clickable {
-                                viewModel.connectTo(peer.deviceAddress)
+                                Text(
+                                    text = msg,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer
+                                )
                             }
-                        )
-                        HorizontalDivider()
-                    }
-                }
-            } else {
-                // Receiver-only standby: visible to nearby senders and waits to accept
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    RadarAnimation()
-                    Spacer(modifier = Modifier.height(24.dp))
-                    Text(
-                        text = "Waiting for Sender",
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    if (!thisDeviceName.isNullOrBlank()) {
-                        Text(
-                            text = "Device Name: $thisDeviceName",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                    }
-                    Text(
-                        text = "Your device is visible to nearby senders.\nOnce a sender connects, you can accept to start the transfer.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        textAlign = TextAlign.Center,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(24.dp))
-                    if (!isDiscovering) {
-                        OutlinedButton(onClick = { viewModel.startDiscovery() }) {
-                            Icon(Icons.Default.Refresh, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Make Discoverable Again")
                         }
                     }
+                }
+
+                if (isSender) {
+                    SenderDiscoveryView(
+                        isDiscovering = isDiscovering,
+                        peers = peers,
+                        connectingAddress = connectingAddress,
+                        onConnect = { address ->
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            connectingAddress = address
+                            viewModel.connectTo(address)
+                        },
+                        onRescan = {
+                            connectingAddress = null
+                            viewModel.startDiscovery()
+                        }
+                    )
+                } else {
+                    ReceiverStandbyView(
+                        thisDeviceName = thisDeviceName,
+                        isDiscovering = isDiscovering,
+                        onMakeDiscoverable = { viewModel.startDiscovery() }
+                    )
                 }
             }
         }
@@ -329,47 +220,335 @@ fun NearbyDiscoveryScreen(
 }
 
 @Composable
-fun RadarAnimation() {
-    val infiniteTransition = rememberInfiniteTransition(label = "radar")
-    val scale by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(2000, easing = LinearOutSlowInEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "radarScale"
-    )
-    val alpha by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(2000, easing = LinearOutSlowInEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "radarAlpha"
-    )
+private fun SenderDiscoveryView(
+    isDiscovering: Boolean,
+    peers: List<android.net.wifi.p2p.WifiP2pDevice>,
+    connectingAddress: String?,
+    onConnect: (String) -> Unit,
+    onRescan: () -> Unit
+) {
+    val primaryColor = MaterialTheme.colorScheme.primary
 
-    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(150.dp)) {
+    Column(modifier = Modifier.fillMaxSize()) {
         Box(
             modifier = Modifier
-                .size(100.dp)
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.primary)
+                .fillMaxWidth()
+                .height(210.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            if (isDiscovering) {
+                TwPulseRing(color = primaryColor, modifier = Modifier.size(200.dp), ringCount = 3)
+            }
+            Box(
+                modifier = Modifier
+                    .size(72.dp)
+                    .clip(CircleShape)
+                    .background(primaryColor),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Wifi,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(34.dp)
+                )
+            }
+        }
+
+        Text(
+            text = when {
+                connectingAddress != null -> "Establishing Wi-Fi Direct link…"
+                isDiscovering             -> "Scanning for nearby receivers…"
+                peers.isEmpty()           -> "No nearby receivers found"
+                else                      -> "${peers.size} receiver${if (peers.size > 1) "s" else ""} ready"
+            },
+            style = MaterialTheme.typography.titleSmall,
+            color = if (connectingAddress != null || isDiscovering) primaryColor
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = TwSpacing.Large)
         )
-        Icon(
-            imageVector = Icons.Default.Wifi,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onPrimary,
-            modifier = Modifier.size(48.dp)
+
+        Spacer(Modifier.height(TwSpacing.Default))
+
+        if (peers.isEmpty() && !isDiscovering) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(horizontal = TwSpacing.Large),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "Ask the receiver to open\nReceive → Nearby Standby on their phone.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(TwSpacing.Default))
+                    TwOutlinedButton("Scan Again", onRescan, leadingIcon = Icons.Default.Refresh)
+                }
+            }
+        } else {
+            if (peers.isNotEmpty()) {
+                TwSectionLabel(
+                    text = "Available Receivers",
+                    modifier = Modifier.padding(horizontal = TwSpacing.Default)
+                )
+                Spacer(Modifier.height(TwSpacing.Small))
+            }
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = TwSpacing.Default, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(peers, key = { it.deviceAddress }) { peer ->
+                    val isConnecting = connectingAddress == peer.deviceAddress
+                    PeerDeviceCard(
+                        peer = peer,
+                        isConnecting = isConnecting,
+                        onConnect = { onConnect(peer.deviceAddress) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReceiverStandbyView(
+    thisDeviceName: String?,
+    isDiscovering: Boolean,
+    onMakeDiscoverable: () -> Unit
+) {
+    val secondaryColor = MaterialTheme.colorScheme.secondary
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(TwSpacing.Large),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Box(
+            modifier = Modifier.size(196.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            if (isDiscovering) {
+                TwPulseRing(color = secondaryColor, modifier = Modifier.fillMaxSize(), ringCount = 3)
+            }
+            Box(
+                modifier = Modifier
+                    .size(80.dp)
+                    .clip(CircleShape)
+                    .background(secondaryColor),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.WifiTethering,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(38.dp)
+                )
+            }
+        }
+
+        Spacer(Modifier.height(TwSpacing.Large))
+
+        Text(
+            text = "Waiting for Sender",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold
         )
+        Spacer(Modifier.height(TwSpacing.Small))
+
+        if (!thisDeviceName.isNullOrBlank()) {
+            Surface(
+                shape = ShapePill,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                border = androidx.compose.foundation.BorderStroke(1.dp, secondaryColor.copy(alpha = 0.3f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PhoneAndroid,
+                        contentDescription = null,
+                        tint = secondaryColor,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = thisDeviceName,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+        }
+
+        Text(
+            text = "Your device is visible to nearby senders.\nOnce a sender connects, you can accept to start receiving files.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+
+        if (!isDiscovering) {
+            Spacer(Modifier.height(TwSpacing.Large))
+            TwOutlinedButton(
+                text = "Make Discoverable Again",
+                onClick = onMakeDiscoverable,
+                leadingIcon = Icons.Default.Refresh
+            )
+        }
+    }
+}
+
+@Composable
+private fun NearbyConnectedView(
+    isSender: Boolean,
+    onConfirm: () -> Unit,
+    onDecline: () -> Unit
+) {
+    val accent = if (isSender) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(TwSpacing.Large),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
         Box(
             modifier = Modifier
-                .fillMaxSize()
+                .size(88.dp)
                 .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.primary.copy(alpha = alpha))
-                .align(Alignment.Center)
-                .graphicsLayer(scaleX = scale * 1.5f, scaleY = scale * 1.5f)
+                .background(accent.copy(alpha = 0.14f))
+                .border(1.dp, accent.copy(alpha = 0.35f), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.Wifi,
+                contentDescription = null,
+                tint = accent,
+                modifier = Modifier.size(44.dp)
+            )
+        }
+        Spacer(Modifier.height(TwSpacing.Large))
+        Text(
+            text = if (isSender) "Connected to Receiver" else "Incoming Nearby Transfer",
+            style = MaterialTheme.typography.headlineSmall,
+            textAlign = TextAlign.Center
         )
+        Spacer(Modifier.height(TwSpacing.Small))
+        Text(
+            text = if (isSender)
+                "Ready to send files.\nWaiting for receiver to accept."
+            else
+                "A nearby sender wants to send files to this device.\nAccept to begin receiving.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(TwSpacing.XLarge))
+        if (isSender) {
+            TwPrimaryButton(
+                text = "Start Sending",
+                onClick = onConfirm,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                leadingIcon = Icons.AutoMirrored.Filled.Send
+            )
+        } else {
+            TwSecondaryButton(
+                text = "Accept & Receive Files",
+                onClick = onConfirm,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                leadingIcon = Icons.Default.Download
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        TwDestructiveButton(
+            text = if (isSender) "Disconnect" else "Decline",
+            onClick = onDecline,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
+private fun PeerDeviceCard(
+    peer: android.net.wifi.p2p.WifiP2pDevice,
+    isConnecting: Boolean,
+    onConnect: () -> Unit
+) {
+    TwCard(
+        modifier = Modifier.fillMaxWidth(),
+        borderColor = if (isConnecting) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+        onClick = onConnect
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(TwSpacing.Default),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(46.dp)
+                    .clip(ShapeSmall)
+                    .background(MaterialTheme.colorScheme.primaryContainer),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.PhoneAndroid,
+                    contentDescription = "Receiver Device",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = peer.deviceName.ifBlank { "Nearby Device" },
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = if (isConnecting) "Connecting…" else "Tap to connect • ${peer.deviceAddress}",
+                    style = MonoSmall,
+                    color = if (isConnecting) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (isConnecting) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Default.ChevronRight,
+                    contentDescription = "Connect",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
     }
 }

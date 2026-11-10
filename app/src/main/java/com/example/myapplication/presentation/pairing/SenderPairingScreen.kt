@@ -1,24 +1,42 @@
 package com.example.myapplication.presentation.pairing
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.myapplication.domain.model.PairingStatus
+import com.example.myapplication.presentation.components.*
+import com.example.myapplication.presentation.theme.*
+import com.example.myapplication.util.PairingShareHelper
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SenderPairingScreen(
     onNavigateBack: () -> Unit,
@@ -29,161 +47,448 @@ fun SenderPairingScreen(
     val qrCodeBitmap by viewModel.qrCodeBitmap.collectAsState()
     val timeRemaining by viewModel.timeRemainingSeconds.collectAsState()
     val joinRequestReceiverId by viewModel.joinRequestReceiverId.collectAsState()
+    val context = LocalContext.current
+
+    LaunchedEffect(session?.status) {
+        if (session?.status == PairingStatus.PAIRED || session?.status == PairingStatus.EXPIRED) {
+            PairingShareHelper.cleanupSharedQrFile(context)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { PairingShareHelper.cleanupSharedQrFile(context) }
+    }
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Remote Transfer") },
-                navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimary,
-                    navigationIconContentColor = MaterialTheme.colorScheme.onPrimary
-                )
+            TwTopBar(
+                title = "Remote Pairing",
+                onBack = onNavigateBack
             )
-        }
-    ) { paddingValues ->
-        Column(
+        },
+        containerColor = MaterialTheme.colorScheme.background
+    ) { padding ->
+        Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(paddingValues)
-                .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+                .padding(padding)
+                .padding(horizontal = TwSpacing.Large, vertical = TwSpacing.Default),
+            contentAlignment = Alignment.Center
         ) {
-            if (session == null) {
-                CircularProgressIndicator()
-                return@Column
-            }
-
-            if (session?.status == PairingStatus.PAIRED) {
-                Text(
-                    text = "Paired Successfully!",
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(onClick = onNavigateToTransfer) {
-                    Text("Start Transfer")
+            when {
+                session == null -> {
+                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                 }
-                return@Column
-            }
 
-            if (session?.status == PairingStatus.EXPIRED) {
-                Text(
-                    text = "Session Expired",
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.error
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(onClick = { viewModel.generateNewSession() }) {
-                    Icon(Icons.Default.Refresh, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Generate New Code")
+                session?.status == PairingStatus.PAIRED -> {
+                    PairedReadyState(onNavigateToTransfer = onNavigateToTransfer)
                 }
-                return@Column
-            }
-            
-            if (joinRequestReceiverId != null) {
-                Text(
-                    text = "Receiver wants to join",
-                    style = MaterialTheme.typography.headlineMedium
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly
-                ) {
-                    OutlinedButton(onClick = { viewModel.rejectRequest() }) {
-                        Text("Reject")
-                    }
-                    Button(onClick = { viewModel.approveRequest() }) {
-                        Text("Approve")
-                    }
-                }
-                return@Column
-            }
 
-            Text(
-                text = "Scan QR Code",
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.Bold
+                session?.status == PairingStatus.EXPIRED -> {
+                    ExpiredSessionState(onGenerate = { viewModel.generateNewSession() })
+                }
+
+                joinRequestReceiverId != null -> {
+                    IncomingJoinRequestCard(
+                        onApprove = { viewModel.approveRequest() },
+                        onReject = { viewModel.rejectRequest() }
+                    )
+                }
+
+                else -> {
+                    QrPinPassTicket(
+                        qrCodeBitmap = qrCodeBitmap,
+                        pin = session?.pin ?: "------",
+                        timeRemaining = timeRemaining
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PairedReadyState(onNavigateToTransfer: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier
+                .size(92.dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.tertiaryContainer),
+            contentAlignment = Alignment.Center
+        ) {
+            TwAnimatedCheckmark(color = MaterialTheme.colorScheme.tertiary)
+        }
+        Spacer(Modifier.height(TwSpacing.Large))
+        Text(
+            text = "Receiver Paired",
+            style = MaterialTheme.typography.headlineSmall,
+            color = MaterialTheme.colorScheme.tertiary
+        )
+        Spacer(Modifier.height(TwSpacing.Small))
+        Text(
+            text = "Secure signaling complete. Tap below to begin streaming your files directly.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(TwSpacing.XLarge))
+        TwPrimaryButton(
+            text = "Start Transfer",
+            onClick = onNavigateToTransfer,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(52.dp),
+            leadingIcon = Icons.AutoMirrored.Filled.Send
+        )
+    }
+}
+
+@Composable
+private fun ExpiredSessionState(onGenerate: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier
+                .size(84.dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.errorContainer),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.TimerOff,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.error,
+                modifier = Modifier.size(42.dp)
             )
-            
-            Spacer(modifier = Modifier.height(8.dp))
-            
+        }
+        Spacer(Modifier.height(TwSpacing.Large))
+        Text(
+            text = "Pairing Code Expired",
+            style = MaterialTheme.typography.headlineSmall,
+            color = MaterialTheme.colorScheme.error
+        )
+        Spacer(Modifier.height(TwSpacing.Small))
+        Text(
+            text = "For security, pairing tokens expire after 2 minutes. Generate a fresh code to continue.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(TwSpacing.XLarge))
+        TwPrimaryButton(
+            text = "Generate New Code",
+            onClick = onGenerate,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(52.dp),
+            leadingIcon = Icons.Default.Refresh
+        )
+    }
+}
+
+@Composable
+private fun IncomingJoinRequestCard(
+    onApprove: () -> Unit,
+    onReject: () -> Unit
+) {
+    TwCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(TwSpacing.Large),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(
+                modifier = Modifier.size(110.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                TwPulseRing(color = MaterialTheme.colorScheme.primary, modifier = Modifier.fillMaxSize(), ringCount = 2)
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.primaryContainer),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.VerifiedUser,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.height(TwSpacing.Default))
             Text(
-                text = "Ask the receiver to scan this QR code.",
-                style = MaterialTheme.typography.bodyLarge,
+                text = "Approve Receiver?",
+                style = MaterialTheme.typography.titleLarge,
                 textAlign = TextAlign.Center
             )
-
-            Spacer(modifier = Modifier.height(32.dp))
-
-            Surface(
-                shadowElevation = 8.dp,
-                shape = MaterialTheme.shapes.medium,
-                color = MaterialTheme.colorScheme.surface
+            Spacer(Modifier.height(TwSpacing.Small))
+            Text(
+                text = "A receiver entered your pairing credentials and wants to connect to this transfer session.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(TwSpacing.Large))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                if (qrCodeBitmap != null) {
-                    Image(
-                        bitmap = qrCodeBitmap!!.asImageBitmap(),
-                        contentDescription = "QR Code",
-                        modifier = Modifier
-                            .size(250.dp)
-                            .padding(16.dp)
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier.size(250.dp),
-                        contentAlignment = Alignment.Center
+                TwDestructiveButton(
+                    text = "Reject",
+                    onClick = onReject,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(50.dp)
+                )
+                TwPrimaryButton(
+                    text = "Approve",
+                    onClick = onApprove,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(50.dp),
+                    leadingIcon = Icons.Default.Check
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun QrPinPassTicket(
+    qrCodeBitmap: android.graphics.Bitmap?,
+    pin: String,
+    timeRemaining: Long
+) {
+    val expiryFraction = (timeRemaining / 120f).coerceIn(0f, 1f)
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+    val haptic = LocalHapticFeedback.current
+    var copiedPin by remember { mutableStateOf(false) }
+
+    LaunchedEffect(copiedPin) {
+        if (copiedPin) {
+            delay(2000)
+            copiedPin = false
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(TwSpacing.Default)
+    ) {
+        Text(
+            text = "On the receiver, open Receive and scan this code or enter the PIN.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+
+        // Architectural QR Ticket Card (crisp white QR field ensures optimal scanner contrast)
+        TwCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = ShapeLarge
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(TwSpacing.Large),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier.size(236.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    // White backing card for QR legibility in both light and dark modes
+                    Surface(
+                        modifier = Modifier.size(216.dp),
+                        shape = ShapeDefault,
+                        color = Color.White
                     ) {
-                        CircularProgressIndicator()
+                        Box(contentAlignment = Alignment.Center) {
+                            if (qrCodeBitmap != null) {
+                                Image(
+                                    bitmap = qrCodeBitmap.asImageBitmap(),
+                                    contentDescription = "Session QR Code",
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(14.dp)
+                                )
+                            } else {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(36.dp),
+                                    color = CobaltBlue
+                                )
+                            }
+                        }
+                    }
+
+                    // Corner framing brackets
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val len = 20.dp.toPx()
+                        val w = size.width
+                        val h = size.height
+                        val stroke = 3.dp.toPx()
+                        drawLine(primaryColor, Offset(0f, 0f), Offset(len, 0f), stroke, StrokeCap.Round)
+                        drawLine(primaryColor, Offset(0f, 0f), Offset(0f, len), stroke, StrokeCap.Round)
+                        drawLine(primaryColor, Offset(w, 0f), Offset(w - len, 0f), stroke, StrokeCap.Round)
+                        drawLine(primaryColor, Offset(w, 0f), Offset(w, len), stroke, StrokeCap.Round)
+                        drawLine(primaryColor, Offset(0f, h), Offset(len, h), stroke, StrokeCap.Round)
+                        drawLine(primaryColor, Offset(0f, h), Offset(0f, h - len), stroke, StrokeCap.Round)
+                        drawLine(primaryColor, Offset(w, h), Offset(w - len, h), stroke, StrokeCap.Round)
+                        drawLine(primaryColor, Offset(w, h), Offset(w, h - len), stroke, StrokeCap.Round)
                     }
                 }
+
+                Spacer(Modifier.height(TwSpacing.Large))
+                TwDivider()
+                Spacer(Modifier.height(TwSpacing.Default))
+
+                Text(
+                    text = "Session PIN",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(10.dp))
+
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    pin.forEachIndexed { index, ch ->
+                        if (index == 3) {
+                            Box(
+                                modifier = Modifier
+                                    .width(8.dp)
+                                    .height(48.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("·", style = MonoLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(width = 40.dp, height = 48.dp)
+                                .clip(ShapeSmall)
+                                .background(MaterialTheme.colorScheme.primaryContainer)
+                                .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f), ShapeSmall),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = ch.toString(),
+                                style = MonoLarge.copy(fontSize = 22.sp),
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                Surface(
+                    shape = ShapePill,
+                    color = if (copiedPin) MaterialTheme.colorScheme.tertiaryContainer
+                            else MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier
+                        .clip(ShapePill)
+                        .clickable {
+                            clipboard.setText(AnnotatedString(pin))
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            copiedPin = true
+                        }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (copiedPin) Icons.Default.Check else Icons.Default.ContentCopy,
+                            contentDescription = null,
+                            tint = if (copiedPin) MaterialTheme.colorScheme.tertiary
+                                   else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = if (copiedPin) "Copied" else "Copy PIN",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (copiedPin) MaterialTheme.colorScheme.tertiary
+                                    else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(14.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    TwOutlinedButton(
+                        text = "Share QR",
+                        onClick = {
+                            val bmp = qrCodeBitmap ?: return@TwOutlinedButton
+                            scope.launch { PairingShareHelper.shareQrCode(context, bmp, pin) }
+                        },
+                        enabled = qrCodeBitmap != null,
+                        modifier = Modifier.weight(1f),
+                        leadingIcon = Icons.Default.QrCode2
+                    )
+                    TwPrimaryButton(
+                        text = "Share PIN",
+                        onClick = { PairingShareHelper.sharePin(context, pin, timeRemaining) },
+                        enabled = pin.length == 6 && pin.all(Char::isDigit),
+                        modifier = Modifier.weight(1f),
+                        leadingIcon = Icons.Default.Share
+                    )
+                }
             }
+        }
 
-            Spacer(modifier = Modifier.height(32.dp))
-
-            Text(
-                text = "Or enter PIN:",
-                style = MaterialTheme.typography.bodyLarge
-            )
-            
-            Text(
-                text = session?.pin ?: "------",
-                style = MaterialTheme.typography.displayMedium,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = androidx.compose.ui.unit.TextUnit(8f, androidx.compose.ui.unit.TextUnitType.Sp),
-                color = MaterialTheme.colorScheme.primary
-            )
-
-            Spacer(modifier = Modifier.height(32.dp))
-
-            Text(
-                text = "Code expires in: ${timeRemaining / 60}:${String.format("%02d", timeRemaining % 60)}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
-            CircularProgressIndicator(
-                modifier = Modifier.size(24.dp),
-                strokeWidth = 2.dp
-            )
-            
-            Spacer(modifier = Modifier.height(8.dp))
-            
-            Text(
-                text = "Waiting for receiver to join...",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.primary
-            )
+        // Countdown telemetry footer
+        TwCard(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = TwSpacing.Default, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                val gaugeColor = if (expiryFraction > 0.25f) primaryColor else MaterialTheme.colorScheme.error
+                TwProgressRing(
+                    progress = expiryFraction,
+                    modifier = Modifier.size(40.dp),
+                    progressColor = gaugeColor,
+                    strokeWidth = 4.dp
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Timer,
+                        contentDescription = null,
+                        tint = gaugeColor,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Expires in ${timeRemaining / 60}:${"%02d".format(timeRemaining % 60)}",
+                        style = MonoMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Waiting for receiver…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
         }
     }
 }

@@ -1,10 +1,12 @@
 package com.example.myapplication.presentation.receive
 
+import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.myapplication.data.remote.SignalingClient
 import com.example.myapplication.data.remote.SignalingEvent
+import com.example.myapplication.util.PairingShareHelper
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -13,6 +15,9 @@ import kotlinx.coroutines.launch
 class ReceiverPairingViewModel : ViewModel() {
     private val _scanState = MutableStateFlow<ReceiverState>(ReceiverState.Scanning)
     val scanState: StateFlow<ReceiverState> = _scanState.asStateFlow()
+
+    private val _isDecodingImage = MutableStateFlow(false)
+    val isDecodingImage: StateFlow<Boolean> = _isDecodingImage.asStateFlow()
 
     private var failedAttempts = 0
 
@@ -43,7 +48,7 @@ class ReceiverPairingViewModel : ViewModel() {
 
     fun handleQrScanned(qrContent: String) {
         if (_scanState.value !is ReceiverState.Scanning) return
-        
+
         try {
             val uri = Uri.parse(qrContent)
             if (uri.scheme == "tw" && uri.host == "pair") {
@@ -58,14 +63,34 @@ class ReceiverPairingViewModel : ViewModel() {
             } else {
                 _scanState.value = ReceiverState.Error("Unrecognized QR code")
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             _scanState.value = ReceiverState.Error("Failed to parse QR code")
+        }
+    }
+
+    fun handleQrImageUri(context: Context, imageUri: Uri) {
+        if (_scanState.value !is ReceiverState.Scanning || _isDecodingImage.value) return
+        val appContext = context.applicationContext
+        viewModelScope.launch {
+            _isDecodingImage.value = true
+            try {
+                val decoded = PairingShareHelper.decodeQrFromUri(appContext, imageUri)
+                if (!decoded.isNullOrBlank()) {
+                    handleQrScanned(decoded)
+                } else {
+                    _scanState.value = ReceiverState.Error(
+                        "No TransWire QR code found in that image. Try a clearer image or enter the 6-digit PIN."
+                    )
+                }
+            } finally {
+                _isDecodingImage.value = false
+            }
         }
     }
 
     fun handlePinEntered(pin: String) {
         if (_scanState.value !is ReceiverState.Scanning) return
-        
+
         if (pin.length == 6 && pin.all { it.isDigit() }) {
             SignalingClient.joinSessionWithPin(pin)
             _scanState.value = ReceiverState.WaitingForSenderApproval
@@ -76,12 +101,13 @@ class ReceiverPairingViewModel : ViewModel() {
             }
         }
     }
-    
+
     fun resetScan() {
         failedAttempts = 0
+        _isDecodingImage.value = false
         _scanState.value = ReceiverState.Scanning
     }
-    
+
     override fun onCleared() {
         super.onCleared()
         if (_scanState.value !is ReceiverState.Paired) {

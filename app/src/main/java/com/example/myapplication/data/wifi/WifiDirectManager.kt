@@ -21,7 +21,7 @@ import kotlinx.coroutines.flow.asStateFlow
 class WifiDirectManager(private val context: Context) {
 
     private val manager: WifiP2pManager? = context.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager?
-    private var channel: WifiP2pManager.Channel? = manager?.initialize(context, Looper.getMainLooper(), null)
+    private val channel: WifiP2pManager.Channel? = manager?.initialize(context, Looper.getMainLooper(), null)
     private var receiver: BroadcastReceiver? = null
 
     private val _peers = MutableStateFlow<List<WifiP2pDevice>>(emptyList())

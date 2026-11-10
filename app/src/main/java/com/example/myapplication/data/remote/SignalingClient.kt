@@ -14,11 +14,15 @@ import java.net.URL
 
 object SignalingClient {
     private var socket: Socket? = null
-    
+
+    const val DEFAULT_SERVER_URL = "http://172.21.2.57:3000"
+    const val EMULATOR_SERVER_URL = "http://10.0.2.2:3000"
+
     // For local emulator testing: "http://10.0.2.2:3000"
-    // For physical device testing, use the IP of the machine running Node.js: "http://192.168.x.x:3000"
-    var serverUrl = "http://192.168.1.13:3000"
-    
+    // For physical device testing, use the LAN IP of the PC running Node.js or a public HTTPS tunnel URL
+    @Volatile
+    var serverUrl = DEFAULT_SERVER_URL
+
     var activeSessionId: String? = null
     
     private val _events = kotlinx.coroutines.flow.MutableSharedFlow<SignalingEvent>(
@@ -27,9 +31,53 @@ object SignalingClient {
     )
     val events = _events.asSharedFlow()
 
+    fun updateServerUrl(rawUrl: String): Boolean {
+        val normalized = rawUrl.trim().trimEnd('/')
+        if (!normalized.startsWith("http://", ignoreCase = true) &&
+            !normalized.startsWith("https://", ignoreCase = true)
+        ) {
+            return false
+        }
+        if (normalized != serverUrl) {
+            disconnect()
+            serverUrl = normalized
+        }
+        return true
+    }
+
+    suspend fun checkServerHealth(targetUrl: String = serverUrl): Result<String> = withContext(Dispatchers.IO) {
+        val base = targetUrl.trim().trimEnd('/')
+        if (!base.startsWith("http://", ignoreCase = true) &&
+            !base.startsWith("https://", ignoreCase = true)
+        ) {
+            return@withContext Result.failure(IllegalArgumentException("URL must start with http:// or https://"))
+        }
+        var conn: HttpURLConnection? = null
+        try {
+            val url = URL("$base/health")
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 3500
+                readTimeout = 3500
+            }
+            val code = conn.responseCode
+            if (code == 200) {
+                Result.success("Server reachable (HTTP 200)")
+            } else {
+                Result.failure(Exception("Server responded with HTTP $code"))
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception(e.message ?: "Unable to reach server"))
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
     fun connect() {
         if (socket?.connected() == true) return
         try {
+            socket?.off()
+            socket?.disconnect()
             socket = IO.socket(serverUrl)
             
             socket?.on(Socket.EVENT_CONNECT) {
@@ -240,6 +288,7 @@ object SignalingClient {
 
     fun disconnect() {
         activeSessionId = null
+        socket?.off()
         socket?.disconnect()
         socket = null
     }
