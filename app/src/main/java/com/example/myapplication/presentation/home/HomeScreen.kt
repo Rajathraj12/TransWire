@@ -56,7 +56,11 @@ fun HomeScreen(
 
     val context = LocalContext.current
     val fileStorageManager = remember(context) { FileStorageManager(context) }
-    val storageSnapshot = remember { viewModel.getStorageSnapshot() }
+    val storageSnapshot by produceState(initialValue = StorageSnapshot(0L, 0L)) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            viewModel.getStorageSnapshot()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -272,16 +276,20 @@ private fun SignalConduitCard(
     val tertiaryColor = MaterialTheme.colorScheme.tertiary
     val outlineColor = MaterialTheme.colorScheme.outline
 
-    val infiniteTransition = rememberInfiniteTransition(label = "conduit")
-    val packetPos by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = if (isTransferRunning) 1100 else 2800, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "packet"
-    )
+    val packetPos = if (isTransferRunning) {
+        val infiniteTransition = rememberInfiniteTransition(label = "conduit")
+        infiniteTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 1100, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "packet"
+        ).value
+    } else {
+        0.5f
+    }
 
     val freeFormatted = remember(storageSnapshot.freeBytes) {
         if (storageSnapshot.freeBytes > 0L) Formatter.formatFileSize(context, storageSnapshot.freeBytes)

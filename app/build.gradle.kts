@@ -1,8 +1,30 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
 }
+
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+val releaseStoreFilePath = keystoreProperties.getProperty("storeFile")
+    ?: System.getenv("TRANSWIRE_STORE_FILE")
+val releaseStorePassword = keystoreProperties.getProperty("storePassword")
+    ?: System.getenv("TRANSWIRE_STORE_PASSWORD")
+val releaseKeyAlias = keystoreProperties.getProperty("keyAlias")
+    ?: System.getenv("TRANSWIRE_KEY_ALIAS")
+val releaseKeyPassword = keystoreProperties.getProperty("keyPassword")
+    ?: System.getenv("TRANSWIRE_KEY_PASSWORD")
+val hasReleaseSigning = !releaseStoreFilePath.isNullOrBlank() &&
+    rootProject.file(releaseStoreFilePath).exists() &&
+    !releaseStorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank() &&
+    !releaseKeyPassword.isNullOrBlank()
 
 android {
     namespace = "com.example.myapplication"
@@ -20,12 +42,33 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("release") {
+            if (hasReleaseSigning) {
+                storeFile = file(releaseStoreFilePath!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             optimization {
                 enable = true
                 packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
+                keepRules {
+                    files.add(file("proguard-rules.pro"))
+                }
             }
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
     compileOptions {
@@ -34,6 +77,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

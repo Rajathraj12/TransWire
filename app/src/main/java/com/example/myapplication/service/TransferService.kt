@@ -12,8 +12,10 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.text.format.Formatter
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -33,6 +35,8 @@ class TransferService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var progressObserverJob: Job? = null
     private var lastNotificationUpdateMs = 0L
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private val largeLogoBitmap: Bitmap? by lazy {
         runCatching { BitmapFactory.decodeResource(resources, R.mipmap.ic_launcher) }.getOrNull()
     }
@@ -71,7 +75,46 @@ class TransferService : Service() {
         )
 
         startObservingProgress()
+        acquireTransferLocks()
         return START_NOT_STICKY
+    }
+
+    private fun acquireTransferLocks() {
+        runCatching {
+            if (wakeLock == null) {
+                val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TransWire::TransferWakeLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(15 * 60 * 1000L)
+            }
+        }
+        runCatching {
+            if (wifiLock == null) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wm?.createWifiLock(mode, "TransWire::TransferWifiLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wifiLock?.isHeld == false) {
+                wifiLock?.acquire()
+            }
+        }
+    }
+
+    private fun releaseTransferLocks() {
+        runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+        wakeLock = null
+        runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
+        wifiLock = null
     }
 
     private fun startObservingProgress() {
@@ -93,6 +136,7 @@ class TransferService : Service() {
     }
 
     private fun handleTransferFinished(state: TransferProgress) {
+        releaseTransferLocks()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
 
         val isSender = TransferSessionCoordinator.isCurrentSessionSender
@@ -220,6 +264,7 @@ class TransferService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
+        releaseTransferLocks()
         TransferSessionCoordinator.onProcessTaskRemoved()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -227,6 +272,7 @@ class TransferService : Service() {
     }
 
     override fun onDestroy() {
+        releaseTransferLocks()
         progressObserverJob?.cancel()
         serviceScope.cancel()
         super.onDestroy()

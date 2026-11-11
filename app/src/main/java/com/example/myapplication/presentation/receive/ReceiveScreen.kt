@@ -34,6 +34,8 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -396,6 +398,9 @@ private fun QrScanViewport(
 
     Box(modifier = Modifier.fillMaxSize()) {
         val analyzer = remember { BarcodeAnalyzer { onQrScanned(it) } }
+        DisposableEffect(analyzer) {
+            onDispose { analyzer.close() }
+        }
         CameraPreview(analyzer = analyzer)
 
         // Subtle scrim
@@ -583,7 +588,11 @@ private fun PinEntryPane(
         BasicTextField(
             value = pinInput,
             onValueChange = onPinChange,
-            modifier = Modifier.focusRequester(focusRequester),
+            modifier = Modifier
+                .focusRequester(focusRequester)
+                .semantics {
+                    contentDescription = "6-digit pairing PIN input, ${pinInput.length} of 6 digits entered"
+                },
             keyboardOptions = KeyboardOptions(
                 keyboardType = KeyboardType.Number,
                 imeAction = ImeAction.Done

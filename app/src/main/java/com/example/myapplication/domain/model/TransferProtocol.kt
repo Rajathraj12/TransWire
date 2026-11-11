@@ -1,6 +1,8 @@
 package com.example.myapplication.domain.model
 
-const val DEFAULT_CHUNK_SIZE = 32 * 1024
+import androidx.compose.runtime.Immutable
+
+const val DEFAULT_CHUNK_SIZE = 56 * 1024
 
 data class FileManifest(
     val fileId: String,
@@ -27,6 +29,7 @@ sealed class TransferMessage {
     data class ResumeState(val files: List<FileResumeInfo>) : TransferMessage()
 }
 
+@Immutable
 data class TransferredFileItem(
     val fileId: String,
     val fileName: String,
@@ -36,6 +39,7 @@ data class TransferredFileItem(
     val fileUri: String? = null
 )
 
+@Immutable
 data class TransferProgress(
     val currentFileName: String,
     val fileProgress: Float,

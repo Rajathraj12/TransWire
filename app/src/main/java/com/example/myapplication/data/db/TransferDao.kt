@@ -47,4 +47,10 @@ interface TransferDao {
 
     @Query("SELECT * FROM transfers ORDER BY timestamp DESC, sessionId DESC")
     fun observeAllTransfers(): Flow<List<TransferEntity>>
+
+    @Query("DELETE FROM transfers WHERE status NOT IN ('PENDING', 'IN_PROGRESS')")
+    suspend fun deleteNonActiveHistory(): Int
+
+    @Query("DELETE FROM transfers WHERE fileId = :fileId")
+    suspend fun deleteById(fileId: String): Int
 }

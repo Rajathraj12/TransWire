@@ -13,3 +13,11 @@
 .externalNativeBuild
 .cxx
 local.properties
+keystore.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+.kotlin/
+backend/backend.log
+backend/dist/

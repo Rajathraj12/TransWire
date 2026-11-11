@@ -7,6 +7,7 @@ import com.example.myapplication.data.db.TransferEntity
 import com.example.myapplication.data.storage.FileStorageManager
 import com.example.myapplication.domain.model.*
 import com.example.myapplication.domain.transport.TransferTransport
+import com.example.myapplication.presentation.settings.PrivacyPreferences
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -54,6 +55,8 @@ class TransferManager(
     private var activeChunkIndex: Int = 0
     @Volatile
     private var peerErrorMessage: String? = null
+    @Volatile
+    private var lastProgressEmitAt: Long = 0L
 
     private val _progress = MutableStateFlow(
         TransferProgress("", 0f, 0L, 0L, 0L, 0L)
@@ -66,6 +69,9 @@ class TransferManager(
     companion object {
         private const val PEER_ACK_TIMEOUT_MS = 120_000L
         private const val POST_COMPLETION_CLOSE_WAIT_MS = 5_000L
+        private const val PROGRESS_EMIT_INTERVAL_MS = 120L
+        private const val DB_PERSIST_CHUNK_BATCH = 48
+        private const val DB_PERSIST_INTERVAL_MS = 1_500L
     }
 
     suspend fun start(files: List<SelectedFile> = emptyList()) {
@@ -319,11 +325,10 @@ class TransferManager(
                                     throw NonRetryableTransferException("Unexpected end of file while reading \"${selectedFile.name}\".")
                                 }
 
-                                val payload = if (bytesRead == buffer.size) buffer.copyOf() else buffer.copyOf(bytesRead)
-                                digest.update(payload)
+                                digest.update(buffer, 0, bytesRead)
 
                                 if (!tracker.isVerified(chunkIdx)) {
-                                    transport.writeMessage(TransferMessage.Chunk(fileInfo.fileId, chunkIdx, bytesRead, payload))
+                                    transport.writeMessage(TransferMessage.Chunk(fileInfo.fileId, chunkIdx, bytesRead, buffer))
                                     fileTransferred += bytesRead
                                     totalTransferred += bytesRead
                                     updateProgress(
@@ -567,6 +572,7 @@ class TransferManager(
             var completedFiles = 0
             var firstFailureMessage: String? = null
             val completedFileIds = HashSet<String>()
+            val pendingCompletions = HashMap<String, String>()
             while (completedFiles < sanitizedManifest.size) {
                 if (isCancelled) throw TransferCancelledException()
 
@@ -603,7 +609,7 @@ class TransferManager(
                         val countSincePersist = (chunksSincePersist[msg.fileId] ?: 0) + 1
                         chunksSincePersist[msg.fileId] = countSincePersist
                         val now = System.currentTimeMillis()
-                        if (countSincePersist >= 16 || now - lastPersistAt >= 500L) {
+                        if (countSincePersist >= DB_PERSIST_CHUNK_BATCH || now - lastPersistAt >= DB_PERSIST_INTERVAL_MS) {
                             dao.updateChunkProgress(
                                 fileId = msg.fileId,
                                 bytes = fileBytes,
@@ -623,84 +629,51 @@ class TransferManager(
                             startTime = startTime,
                             sessionStartBytes = sessionStartBytes
                         )
+
+                        val pendingSha = pendingCompletions[msg.fileId]
+                        if (pendingSha != null && tracker.isComplete()) {
+                            pendingCompletions.remove(msg.fileId)
+                            if (completedFileIds.add(msg.fileId)) {
+                                val failure = finalizeReceivedFile(
+                                    fileId = msg.fileId,
+                                    expectedSha256 = pendingSha,
+                                    activeFiles = activeFiles,
+                                    trackers = trackers,
+                                    tempFiles = tempFiles,
+                                    randomAccessFiles = randomAccessFiles,
+                                    onErrorAckSent = { notifiedSenderError = true }
+                                )
+                                if (failure != null && firstFailureMessage == null) {
+                                    firstFailureMessage = failure
+                                }
+                                completedFiles++
+                            }
+                        }
                     }
                     is TransferMessage.Completion -> {
+                        if (completedFileIds.contains(msg.fileId) || pendingCompletions.containsKey(msg.fileId)) {
+                            continue
+                        }
+                        val tracker = trackers[msg.fileId]
+                        if (tracker != null && !tracker.isComplete()) {
+                            // Unordered / multi-channel chunks may still be arriving slightly behind Control
+                            pendingCompletions[msg.fileId] = msg.sha256
+                            continue
+                        }
                         if (!completedFileIds.add(msg.fileId)) {
                             continue
                         }
-                        val fileInfo = activeFiles[msg.fileId]
-                        val tracker = trackers[msg.fileId]
-                        val tempFile = tempFiles[msg.fileId]
-                        val raf = randomAccessFiles.remove(msg.fileId)
-                        runCatching { raf?.fd?.sync() }
-                        runCatching { raf?.close() }
-
-                        if (fileInfo != null && tracker != null && tempFile != null) {
-                            if (!tracker.isComplete()) {
-                                val errMsg = "Incomplete file received for \"${fileInfo.name}\" (${tracker.verifiedCount()}/${tracker.totalChunks} chunks)"
-                                notifiedSenderError = true
-                                runCatching { transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, false, errMsg)) }
-                                runCatching { transport.flush() }
-                                persistInterruptedState(activeFiles, trackers)
-                                throw Exception(errMsg)
-                            }
-
-                            val calculatedSha = fileStorageManager.computeFileSha256(tempFile)
-                            if (calculatedSha.equals(msg.sha256, ignoreCase = true)) {
-                                if (!fileStorageManager.hasSufficientStorage(fileInfo.size)) {
-                                    val errMsg = "Insufficient storage space to save \"${fileInfo.name}\"."
-                                    dao.updateFailure(msg.fileId, "FAILED", "Insufficient storage saving file")
-                                    notifiedSenderError = true
-                                    runCatching { transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, false, errMsg)) }
-                                    runCatching { transport.flush() }
-                                    throw Exception(errMsg)
-                                }
-                                val savedUri = fileStorageManager.saveToDownloads(tempFile, fileInfo.name, fileInfo.mimeType)
-                                val uriString = savedUri?.toString()
-                                val finalName = if (savedUri != null) {
-                                    fileStorageManager.resolveSavedDisplayName(savedUri, fileInfo.name)
-                                } else {
-                                    fileInfo.name
-                                }
-                                val finalStatus = if (uriString != null) "COMPLETED" else "FAILED"
-                                if (finalStatus == "COMPLETED") {
-                                    dao.updateCompletion(msg.fileId, "COMPLETED", uriString, finalName)
-                                } else {
-                                    dao.updateFailure(msg.fileId, "FAILED", "Failed to save file to Downloads")
-                                }
-                                synchronized(sessionFiles) {
-                                    sessionFiles[msg.fileId] = TransferredFileItem(
-                                        fileId = fileInfo.fileId,
-                                        fileName = finalName,
-                                        mimeType = fileInfo.mimeType,
-                                        size = fileInfo.size,
-                                        status = finalStatus,
-                                        fileUri = uriString
-                                    )
-                                }
-                                if (finalStatus == "COMPLETED") {
-                                    transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, true))
-                                } else {
-                                    val errMsg = "Failed to save \"${fileInfo.name}\" to Downloads"
-                                    if (firstFailureMessage == null) firstFailureMessage = errMsg
-                                    notifiedSenderError = true
-                                    runCatching { transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, false, errMsg)) }
-                                }
-                            } else {
-                                // Corrupted file: purge temp file and reset ranges so retry fetches clean data
-                                fileStorageManager.deleteTempFile(tempFile)
-                                dao.updateChunkProgress(msg.fileId, 0L, "", "FAILED")
-                                dao.updateFailure(msg.fileId, "FAILED", "SHA-256 verification failed")
-                                synchronized(sessionFiles) {
-                                    sessionFiles[msg.fileId]?.let { existing ->
-                                        sessionFiles[msg.fileId] = existing.copy(status = "FAILED")
-                                    }
-                                }
-                                val errMsg = "SHA-256 verification failed for \"${fileInfo.name}\""
-                                if (firstFailureMessage == null) firstFailureMessage = errMsg
-                                notifiedSenderError = true
-                                runCatching { transport.writeMessage(TransferMessage.CompletionAck(msg.fileId, false, errMsg)) }
-                            }
+                        val failure = finalizeReceivedFile(
+                            fileId = msg.fileId,
+                            expectedSha256 = msg.sha256,
+                            activeFiles = activeFiles,
+                            trackers = trackers,
+                            tempFiles = tempFiles,
+                            randomAccessFiles = randomAccessFiles,
+                            onErrorAckSent = { notifiedSenderError = true }
+                        )
+                        if (failure != null && firstFailureMessage == null) {
+                            firstFailureMessage = failure
                         }
                         completedFiles++
                     }
@@ -768,6 +741,98 @@ class TransferManager(
         }
     }
 
+    private suspend fun finalizeReceivedFile(
+        fileId: String,
+        expectedSha256: String,
+        activeFiles: Map<String, FileManifest>,
+        trackers: Map<String, ChunkRangeTracker>,
+        tempFiles: Map<String, File>,
+        randomAccessFiles: MutableMap<String, RandomAccessFile>,
+        onErrorAckSent: () -> Unit
+    ): String? {
+        val fileInfo = activeFiles[fileId]
+        val tracker = trackers[fileId]
+        val tempFile = tempFiles[fileId]
+        val raf = randomAccessFiles.remove(fileId)
+        runCatching { raf?.fd?.sync() }
+        runCatching { raf?.close() }
+
+        if (fileInfo == null || tracker == null || tempFile == null) {
+            return null
+        }
+
+        if (!tracker.isComplete()) {
+            val errMsg = "Incomplete file received for \"${fileInfo.name}\" (${tracker.verifiedCount()}/${tracker.totalChunks} chunks)"
+            onErrorAckSent()
+            runCatching { transport.writeMessage(TransferMessage.CompletionAck(fileId, false, errMsg)) }
+            runCatching { transport.flush() }
+            persistInterruptedState(activeFiles, trackers)
+            throw Exception(errMsg)
+        }
+
+        val calculatedSha = fileStorageManager.computeFileSha256(tempFile)
+        if (calculatedSha.equals(expectedSha256, ignoreCase = true)) {
+            if (!fileStorageManager.hasSufficientStorage(fileInfo.size)) {
+                val errMsg = "Insufficient storage space to save \"${fileInfo.name}\"."
+                dao.updateFailure(fileId, "FAILED", "Insufficient storage saving file")
+                onErrorAckSent()
+                runCatching { transport.writeMessage(TransferMessage.CompletionAck(fileId, false, errMsg)) }
+                runCatching { transport.flush() }
+                throw Exception(errMsg)
+            }
+            val savedUri = fileStorageManager.saveToDownloads(tempFile, fileInfo.name, fileInfo.mimeType)
+            val uriString = savedUri?.toString()
+            val finalName = if (savedUri != null) {
+                fileStorageManager.resolveSavedDisplayName(savedUri, fileInfo.name)
+            } else {
+                fileInfo.name
+            }
+            val finalStatus = if (uriString != null) "COMPLETED" else "FAILED"
+            if (finalStatus == "COMPLETED") {
+                if (PrivacyPreferences.isHistoryRetentionEnabled(context)) {
+                    dao.updateCompletion(fileId, "COMPLETED", uriString, finalName)
+                } else {
+                    dao.deleteById(fileId)
+                }
+            } else {
+                dao.updateFailure(fileId, "FAILED", "Failed to save file to Downloads")
+            }
+            synchronized(sessionFiles) {
+                sessionFiles[fileId] = TransferredFileItem(
+                    fileId = fileInfo.fileId,
+                    fileName = finalName,
+                    mimeType = fileInfo.mimeType,
+                    size = fileInfo.size,
+                    status = finalStatus,
+                    fileUri = uriString
+                )
+            }
+            return if (finalStatus == "COMPLETED") {
+                transport.writeMessage(TransferMessage.CompletionAck(fileId, true))
+                null
+            } else {
+                val errMsg = "Failed to save \"${fileInfo.name}\" to Downloads"
+                onErrorAckSent()
+                runCatching { transport.writeMessage(TransferMessage.CompletionAck(fileId, false, errMsg)) }
+                errMsg
+            }
+        } else {
+            // Corrupted file: purge temp file and reset ranges so retry fetches clean data
+            fileStorageManager.deleteTempFile(tempFile)
+            dao.updateChunkProgress(fileId, 0L, "", "FAILED")
+            dao.updateFailure(fileId, "FAILED", "SHA-256 verification failed")
+            synchronized(sessionFiles) {
+                sessionFiles[fileId]?.let { existing ->
+                    sessionFiles[fileId] = existing.copy(status = "FAILED")
+                }
+            }
+            val errMsg = "SHA-256 verification failed for \"${fileInfo.name}\""
+            onErrorAckSent()
+            runCatching { transport.writeMessage(TransferMessage.CompletionAck(fileId, false, errMsg)) }
+            return errMsg
+        }
+    }
+
     private suspend fun persistInterruptedState(
         activeFiles: Map<String, FileManifest>,
         trackers: Map<String, ChunkRangeTracker>,
@@ -802,7 +867,16 @@ class TransferManager(
         startTime: Long,
         sessionStartBytes: Long
     ) {
-        val elapsed = System.currentTimeMillis() - startTime
+        val now = System.currentTimeMillis()
+        if (now - lastProgressEmitAt < PROGRESS_EMIT_INTERVAL_MS &&
+            fileTransferred < fileTotal &&
+            totalTransferred < totalBytes
+        ) {
+            return
+        }
+        lastProgressEmitAt = now
+
+        val elapsed = now - startTime
         val bytesThisRun = (totalTransferred - sessionStartBytes).coerceAtLeast(0L)
         val speed = if (elapsed > 0) (bytesThisRun * 1000L) / elapsed else 0L
         val remainingBytes = (totalBytes - totalTransferred).coerceAtLeast(0L)

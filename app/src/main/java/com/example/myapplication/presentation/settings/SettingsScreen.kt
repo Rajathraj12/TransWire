@@ -1,6 +1,10 @@
 package com.example.myapplication.presentation.settings
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.net.wifi.p2p.WifiP2pManager
+import android.os.Build
 import android.os.Environment
 import android.os.StatFs
 import android.text.format.Formatter
@@ -9,6 +13,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -20,15 +26,26 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import com.example.myapplication.BuildConfig
+import com.example.myapplication.data.db.AppDatabase
 import com.example.myapplication.data.remote.SignalingClient
+import com.example.myapplication.data.storage.FileStorageManager
 import com.example.myapplication.presentation.components.*
 import com.example.myapplication.presentation.theme.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class AppThemeMode(val label: String) {
     SYSTEM("System Default"),
@@ -69,6 +86,21 @@ object ServerPreferences {
     }
 }
 
+object PrivacyPreferences {
+    private const val PREF_NAME = "transwire_prefs"
+    private const val KEY_SAVE_HISTORY = "save_transfer_history"
+
+    fun isHistoryRetentionEnabled(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_SAVE_HISTORY, true)
+    }
+
+    fun setHistoryRetentionEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_SAVE_HISTORY, enabled).apply()
+    }
+}
+
 @Composable
 fun SettingsScreen(
     onNavigateBack: () -> Unit,
@@ -78,15 +110,17 @@ fun SettingsScreen(
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
 
-    val storageInfo = remember {
-        try {
-            val stat = StatFs(Environment.getExternalStorageDirectory().path)
-            val total = stat.totalBytes
-            val free = stat.availableBytes
-            val fraction = if (total > 0L) ((total - free).toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f
-            Triple(free, total, fraction)
-        } catch (_: Exception) {
-            Triple(0L, 1L, 0f)
+    val storageInfo by produceState(initialValue = Triple(0L, 1L, 0f)) {
+        value = withContext(Dispatchers.IO) {
+            try {
+                val stat = StatFs(Environment.getExternalStorageDirectory().path)
+                val total = stat.totalBytes
+                val free = stat.availableBytes
+                val fraction = if (total > 0L) ((total - free).toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f
+                Triple(free, total, fraction)
+            } catch (_: Exception) {
+                Triple(0L, 1L, 0f)
+            }
         }
     }
 
@@ -155,10 +189,14 @@ fun SettingsScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable {
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onThemeModeChange(mode)
-                            }
+                            .selectable(
+                                selected = selected,
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onThemeModeChange(mode)
+                                },
+                                role = Role.RadioButton
+                            )
                             .padding(horizontal = TwSpacing.Default, vertical = 14.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
@@ -197,10 +235,7 @@ fun SettingsScreen(
                         }
                         RadioButton(
                             selected = selected,
-                            onClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onThemeModeChange(mode)
-                            }
+                            onClick = null
                         )
                     }
                     if (index < AppThemeMode.entries.lastIndex) TwDivider(startIndent = 62.dp)
@@ -280,7 +315,241 @@ fun SettingsScreen(
                 )
             }
 
+            Spacer(Modifier.height(TwSpacing.Large))
+
+            // ── Privacy & Data ────────────────────────────────────────────────
+            PrivacySettingsSection(context = context)
+
+            Spacer(Modifier.height(TwSpacing.Large))
+
+            // ── Diagnostics ───────────────────────────────────────────────────
+            DiagnosticsSection(context = context, freeBytes = storageInfo.first)
+
             Spacer(Modifier.height(110.dp))
+        }
+    }
+}
+
+@Composable
+private fun PrivacySettingsSection(context: Context) {
+    val scope = rememberCoroutineScope()
+    val haptic = LocalHapticFeedback.current
+    var saveHistory by remember { mutableStateOf(PrivacyPreferences.isHistoryRetentionEnabled(context)) }
+    var privacyStatus by remember { mutableStateOf<String?>(null) }
+    var showClearConfirm by remember { mutableStateOf(false) }
+
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            title = { Text("Clear Transfer History?") },
+            text = {
+                Text("This removes past transfer records and temporary partial cache files. Saved files in Downloads/Transwire are kept.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearConfirm = false
+                        scope.launch(Dispatchers.IO) {
+                            val dao = AppDatabase.getDatabase(context).transferDao()
+                            val removedRows = dao.deleteNonActiveHistory()
+                            val protected = dao.getResumableTempPaths().toSet()
+                            FileStorageManager(context).cleanupStaleTempFiles(protected)
+                            withContext(Dispatchers.Main) {
+                                privacyStatus = "Cleared $removedRows history record(s) and stale cache."
+                            }
+                        }
+                    }
+                ) {
+                    Text("Clear", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirm = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    TwSectionLabel("Privacy & Data")
+    Spacer(Modifier.height(TwSpacing.Small))
+    TwCard(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .toggleable(
+                    value = saveHistory,
+                    role = Role.Switch,
+                    onValueChange = { enabled ->
+                        saveHistory = enabled
+                        PrivacyPreferences.setHistoryRetentionEnabled(context, enabled)
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        privacyStatus = if (enabled) {
+                            "Completed transfers will appear in History."
+                        } else {
+                            "Completed transfers will not be saved to History."
+                        }
+                    }
+                )
+                .padding(TwSpacing.Default),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.PrivacyTip,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(20.dp)
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Save Transfer History", style = MaterialTheme.typography.titleSmall)
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = "Store completed records locally (cloud backup disabled)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(checked = saveHistory, onCheckedChange = null)
+        }
+
+        TwDivider()
+
+        Column(
+            modifier = Modifier.padding(TwSpacing.Default),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                TwOutlinedButton(
+                    text = "Clear Cache",
+                    onClick = {
+                        scope.launch(Dispatchers.IO) {
+                            val dao = AppDatabase.getDatabase(context).transferDao()
+                            val protected = dao.getResumableTempPaths().toSet()
+                            FileStorageManager(context).cleanupStaleTempFiles(protected)
+                            withContext(Dispatchers.Main) {
+                                privacyStatus = "Temporary transfer cache cleaned."
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    leadingIcon = Icons.Default.CleaningServices
+                )
+                TwOutlinedButton(
+                    text = "Clear History",
+                    onClick = { showClearConfirm = true },
+                    modifier = Modifier.weight(1f),
+                    leadingIcon = Icons.Default.DeleteOutline
+                )
+            }
+
+            privacyStatus?.let { note ->
+                Text(
+                    text = note,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticsSection(context: Context, freeBytes: Long) {
+    val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+    var isRunning by remember { mutableStateOf(false) }
+    var reportText by remember { mutableStateOf<String?>(null) }
+    var copiedNotice by remember { mutableStateOf(false) }
+
+    TwSectionLabel("Diagnostics")
+    Spacer(Modifier.height(TwSpacing.Small))
+    TwCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(TwSpacing.Default),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            SettingsInfoRow(
+                icon = Icons.Default.NetworkCheck,
+                title = "Connection & Device Check",
+                subtitle = "Runs safe checks without exposing tokens, PINs, or personal files."
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                TwPrimaryButton(
+                    text = if (isRunning) "Checking…" else "Run Diagnostics",
+                    onClick = {
+                        scope.launch {
+                            isRunning = true
+                            copiedNotice = false
+                            val serverUrl = ServerPreferences.getServerUrl(context)
+                            val health = SignalingClient.checkServerHealth(serverUrl)
+                            val turn = SignalingClient.probeTurnSummary(serverUrl)
+                            val nearbyPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
+                            } else {
+                                ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                            }
+                            val cameraGranted = ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.CAMERA
+                            ) == PackageManager.PERMISSION_GRANTED
+                            val wifiDirectSupported =
+                                (context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager) != null
+
+                            reportText = buildString {
+                                appendLine("App: TransWire ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+                                appendLine("Android: ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
+                                appendLine("Server: $serverUrl")
+                                appendLine("Signaling: ${health.getOrElse { it.message ?: "Error" }}")
+                                appendLine("TURN Relay: ${turn.getOrElse { it.message ?: "Unavailable" }}")
+                                appendLine("Wi-Fi Direct Hardware: ${if (wifiDirectSupported) "Supported" else "Unavailable"}")
+                                appendLine("Nearby Permission: ${if (nearbyPerm) "Granted" else "Not granted"}")
+                                appendLine("Camera Permission: ${if (cameraGranted) "Granted" else "Not granted"}")
+                                append("Free Space: ${Formatter.formatFileSize(context, freeBytes)}")
+                            }
+                            isRunning = false
+                        }
+                    },
+                    enabled = !isRunning,
+                    modifier = Modifier.weight(1f),
+                    leadingIcon = Icons.Default.BugReport
+                )
+                if (reportText != null) {
+                    TwOutlinedButton(
+                        text = if (copiedNotice) "Copied" else "Copy",
+                        onClick = {
+                            reportText?.let {
+                                clipboard.setText(AnnotatedString(it))
+                                copiedNotice = true
+                            }
+                        },
+                        modifier = Modifier.width(104.dp),
+                        leadingIcon = if (copiedNotice) Icons.Default.Check else Icons.Default.ContentCopy
+                    )
+                }
+            }
+
+            reportText?.let { report ->
+                Surface(
+                    shape = ShapeSmall,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = report,
+                        style = MonoSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(12.dp)
+                    )
+                }
+            }
         }
     }
 }

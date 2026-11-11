@@ -1,6 +1,7 @@
 package com.example.myapplication
 
 import com.example.myapplication.data.storage.FileStorageManager
+import com.example.myapplication.domain.model.DEFAULT_CHUNK_SIZE
 import com.example.myapplication.domain.model.FileManifest
 import com.example.myapplication.domain.model.FileResumeInfo
 import com.example.myapplication.domain.model.TransferMessage
@@ -84,6 +85,11 @@ class Phase8ReliabilitySecurityTest {
         val ackErr = TransferMessage.CompletionAck("file_123", success = false, errorMessage = "SHA-256 verification failed")
         val decodedAckErr = MessageSerializer.deserialize(MessageSerializer.serialize(ackErr))
         assertEquals(ackErr, decodedAckErr)
+
+        val maxChunkFrame = MessageSerializer.serialize(
+            TransferMessage.Chunk("a".repeat(32), 0, DEFAULT_CHUNK_SIZE, ByteArray(DEFAULT_CHUNK_SIZE))
+        )
+        assertTrue(maxChunkFrame.size < 64 * 1024)
     }
 
     @Test(expected = IOException::class)

@@ -25,6 +25,8 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import kotlinx.coroutines.delay
@@ -370,10 +372,20 @@ private fun QrPinPassTicket(
                 )
                 Spacer(Modifier.height(10.dp))
 
+                val spokenPin = remember(pin) {
+                    if (pin.length == 6 && pin.all(Char::isDigit)) {
+                        "Session PIN: ${pin.toCharArray().joinToString(" ")}"
+                    } else {
+                        "Session PIN unavailable"
+                    }
+                }
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .widthIn(max = 312.dp),
+                        .widthIn(max = 312.dp)
+                        .semantics(mergeDescendants = true) {
+                            contentDescription = spokenPin
+                        },
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {

@@ -6,6 +6,8 @@ import {
   iceCandidateSchema,
   joinSessionSchema,
   leaveSessionSchema,
+  rejoinSessionSchema,
+  retryTransferSchema,
   sdpSignalSchema
 } from './types';
 
@@ -192,7 +194,8 @@ export function setupSocketHandlers(io: Server) {
           const receiverSocket = io.sockets.sockets.get(receiverId);
           if (receiverSocket) {
             receiverSocket.join(sessionId);
-            io.to(sessionId).emit('peer-joined', { sessionId });
+            io.to(session.senderSocketId).emit('peer-joined', { sessionId });
+            receiverSocket.emit('peer-joined', { sessionId, pairingToken: session.pairingToken });
             console.log(`[Session] Paired ${sessionId}`);
           } else {
             sessionManager.updateSession(sessionId, {
@@ -296,27 +299,63 @@ export function setupSocketHandlers(io: Server) {
       }
     });
 
+    socket.on('rejoin-session', (data, callback) => {
+      if (!abuseGuard.allowEvent(`ctrl:${socket.id}`, 30, 60_000)) {
+        return callback?.({ success: false, error: 'Too many rejoin requests' });
+      }
+      try {
+        const parsed = rejoinSessionSchema.parse(data);
+        const session = sessionManager.getSessionById(parsed.sessionId);
+        if (!session || session.status !== 'PAIRED') {
+          return callback?.({ success: false, error: 'Session not active' });
+        }
+        if (!sessionManager.verifyPairingToken(session, parsed.pairingToken)) {
+          abuseGuard.recordFailedJoin(clientIp);
+          return callback?.({ success: false, error: 'Invalid pairing token' });
+        }
+
+        sessionManager.updateSession(parsed.sessionId, {
+          ...(parsed.isSender ? { senderSocketId: socket.id } : { receiverSocketId: socket.id }),
+          expiresAt: Date.now() + PAIRED_TTL_MS
+        });
+        socket.join(parsed.sessionId);
+        console.log(`[Session] Rejoined ${parsed.sessionId} (${parsed.isSender ? 'sender' : 'receiver'}) as ${socket.id}`);
+        callback?.({ success: true });
+      } catch {
+        callback?.({ success: false, error: 'Invalid rejoin data' });
+      }
+    });
+
+    socket.on('retry-transfer', (data) => {
+      if (!abuseGuard.allowEvent(`ctrl:${socket.id}`, 20, 60_000)) return;
+      try {
+        const { sessionId } = retryTransferSchema.parse(data);
+        const session = sessionManager.getSessionById(sessionId);
+        if (
+          session &&
+          session.status === 'PAIRED' &&
+          (socket.id === session.senderSocketId || socket.id === session.receiverSocketId)
+        ) {
+          sessionManager.updateSession(sessionId, { expiresAt: Date.now() + PAIRED_TTL_MS });
+          socket.to(sessionId).emit('retry-transfer', { sessionId });
+          console.log(`[Session] Retry requested on ${sessionId}`);
+        }
+      } catch {
+        // Ignore invalid retry payloads
+      }
+    });
+
     socket.on('disconnect', () => {
       console.log(`[Socket] Disconnected: ${socket.id}`);
       sessionManager.getAllSessions().forEach((session) => {
-        if (session.senderSocketId === socket.id) {
-          if (session.status === 'PAIRED') {
-            socket.to(session.sessionId).emit('peer-disconnected');
-            sessionManager.removeSession(session.sessionId);
-          }
-          // Keep PENDING / WAITING_APPROVAL sessions alive until expiresAt so brief app switches
-          // (e.g. sharing QR/PIN to WhatsApp) or mobile network reconnects do not invalidate the QR.
-        } else if (session.receiverSocketId === socket.id) {
-          if (session.status === 'PAIRED') {
-            socket.to(session.sessionId).emit('peer-disconnected');
-            sessionManager.removeSession(session.sessionId);
-          } else if (session.status === 'WAITING_APPROVAL') {
-            sessionManager.updateSession(session.sessionId, {
-              status: 'PENDING',
-              receiverSocketId: undefined
-            });
-          }
+        if (session.receiverSocketId === socket.id && session.status === 'WAITING_APPROVAL') {
+          sessionManager.updateSession(session.sessionId, {
+            status: 'PENDING',
+            receiverSocketId: undefined
+          });
         }
+        // Keep PENDING and PAIRED sessions alive until expiresAt or explicit leave-session so brief
+        // mobile WebSocket drops during transfers or retries do not break active pairs.
       });
     });
   });

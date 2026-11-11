@@ -8,6 +8,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -24,6 +25,14 @@ fun CameraPreview(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
+    val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+
+    DisposableEffect(lifecycleOwner) {
+        onDispose {
+            runCatching { cameraProviderFuture.get().unbindAll() }
+            analysisExecutor.shutdown()
+        }
+    }
 
     AndroidView(
         modifier = modifier.fillMaxSize(),
@@ -41,7 +50,7 @@ fun CameraPreview(
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                     .also {
-                        it.setAnalyzer(Executors.newSingleThreadExecutor(), analyzer)
+                        it.setAnalyzer(analysisExecutor, analyzer)
                     }
 
                 val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA

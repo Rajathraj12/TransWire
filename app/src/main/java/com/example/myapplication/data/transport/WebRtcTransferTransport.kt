@@ -16,6 +16,8 @@ import org.webrtc.*
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 
 class WebRtcTransferTransport(
     private val context: Context
@@ -25,9 +27,11 @@ class WebRtcTransferTransport(
     private var peerConnectionFactory: PeerConnectionFactory? = null
     private var peerConnection: PeerConnection? = null
     private var dataChannel: DataChannel? = null
+    private val stripeChannels = CopyOnWriteArrayList<DataChannel>()
     private var signalingJob: Job? = null
 
-    private val messageChannel = Channel<TransferMessage>(Channel.UNLIMITED)
+    private val rawMessageChannel = Channel<ByteArray>(Channel.UNLIMITED)
+    private val bufferChangeSignal = Channel<Unit>(Channel.CONFLATED)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val writeMutex = Mutex()
     private val iceLock = Any()
@@ -42,9 +46,17 @@ class WebRtcTransferTransport(
     @Volatile
     private var locallyDisconnected = false
 
+    @Volatile
+    private var collectorToken: Long = 0L
+
     companion object {
-        private const val CONNECT_TIMEOUT_MS = 45_000L
-        private const val READ_TIMEOUT_MS = 30_000L
+        private const val CONNECT_TIMEOUT_MS = 60_000L
+        private const val READ_TIMEOUT_MS = 60_000L
+        private const val STALL_TIMEOUT_MS = 60_000L
+        private const val MAX_BUFFERED_BYTES = 4L * 1024L * 1024L
+        private const val CONTROL_CHANNEL_LABEL = "fileTransfer"
+        private const val DATA_CHANNEL_PREFIX = "fileTransfer-data-"
+        private const val DATA_CHANNEL_STRIPES = 3
     }
 
     private fun initFactory() {
@@ -65,18 +77,78 @@ class WebRtcTransferTransport(
         if (closedReason == null) {
             closedReason = cause
         }
-        messageChannel.close(cause)
+        rawMessageChannel.close(cause)
+        bufferChangeSignal.close(cause)
     }
 
     private fun handleDataChannelMessage(buffer: DataChannel.Buffer) {
         if (!buffer.binary) return
         val bytes = ByteArray(buffer.data.remaining())
         buffer.data.get(bytes)
+        rawMessageChannel.trySend(bytes)
+    }
+
+    private fun registerChannelObserver(
+        channel: DataChannel,
+        isPrimaryControl: Boolean,
+        dcDeferred: CompletableDeferred<Unit>?
+    ) {
+        channel.registerObserver(object : DataChannel.Observer {
+            override fun onBufferedAmountChange(previousAmount: Long) {
+                bufferChangeSignal.trySend(Unit)
+            }
+
+            override fun onStateChange() {
+                when (channel.state()) {
+                    DataChannel.State.OPEN -> {
+                        if (isPrimaryControl) {
+                            dcDeferred?.complete(Unit)
+                        }
+                    }
+                    DataChannel.State.CLOSED -> {
+                        if (!locallyDisconnected && (isPrimaryControl || dcDeferred?.isCompleted == true)) {
+                            val err = IOException("WebRTC DataChannel closed")
+                            dcDeferred?.completeExceptionally(err)
+                            failChannel(err)
+                        }
+                    }
+                    else -> {}
+                }
+            }
+
+            override fun onMessage(buffer: DataChannel.Buffer) {
+                handleDataChannelMessage(buffer)
+            }
+        })
+    }
+
+    private fun buildRtcConfiguration(iceServers: List<PeerConnection.IceServer>): PeerConnection.RTCConfiguration {
+        return PeerConnection.RTCConfiguration(iceServers).apply {
+            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            iceCandidatePoolSize = 2
+            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
+            bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+        }
+    }
+
+    private fun launchSignalingCollector(
+        dcDeferred: CompletableDeferred<Unit>,
+        buffered: List<SignalingEvent>,
+        handler: suspend (SignalingEvent) -> Unit
+    ): Job = scope.launch {
         try {
-            messageChannel.trySend(MessageSerializer.deserialize(bytes))
+            for (event in buffered) {
+                handler(event)
+            }
+            SignalingClient.events.collect { event ->
+                handler(event)
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            Log.w(tag, "Rejected invalid transfer frame: ${e.message}")
-            failChannel(IOException("Protocol validation failed: ${e.message}", e))
+            dcDeferred.completeExceptionally(e)
+            failChannel(e)
         }
     }
 
@@ -176,10 +248,14 @@ class WebRtcTransferTransport(
     }
 
     override suspend fun initAsServer(port: Int) {
+        if (!SignalingClient.ensureConnected()) {
+            throw IOException("Signaling session is unavailable. Please pair again.")
+        }
         initFactory()
         locallyDisconnected = false
         closedReason = null
         remoteDescriptionSet = false
+        stripeChannels.clear()
         synchronized(iceLock) { pendingRemoteIceCandidates.clear() }
 
         val iceServers = SignalingClient.getTurnCredentials()
@@ -187,7 +263,7 @@ class WebRtcTransferTransport(
         val dcDeferred = CompletableDeferred<Unit>()
 
         val pc = peerConnectionFactory?.createPeerConnection(
-            iceServers,
+            buildRtcConfiguration(iceServers),
             object : SimplePeerConnectionObserver() {
                 override fun onIceCandidate(candidate: IceCandidate?) {
                     candidate?.let {
@@ -209,37 +285,36 @@ class WebRtcTransferTransport(
         ) ?: throw IOException("Failed to create PeerConnection")
         peerConnection = pc
 
-        val dcInit = DataChannel.Init().apply { ordered = true }
-        dataChannel = pc.createDataChannel("fileTransfer", dcInit)
-        dataChannel?.registerObserver(object : DataChannel.Observer {
-            override fun onBufferedAmountChange(p0: Long) {}
-            override fun onStateChange() {
-                when (dataChannel?.state()) {
-                    DataChannel.State.OPEN -> dcDeferred.complete(Unit)
-                    DataChannel.State.CLOSED -> {
-                        val err = IOException("WebRTC DataChannel closed")
-                        dcDeferred.completeExceptionally(err)
-                        failChannel(err)
-                    }
-                    else -> {}
-                }
-            }
+        val controlInit = DataChannel.Init().apply { ordered = true }
+        val controlDc = pc.createDataChannel(CONTROL_CHANNEL_LABEL, controlInit)
+        dataChannel = controlDc
+        registerChannelObserver(controlDc, isPrimaryControl = true, dcDeferred = dcDeferred)
 
-            override fun onMessage(buffer: DataChannel.Buffer) {
-                handleDataChannelMessage(buffer)
+        val dataInit = DataChannel.Init().apply { ordered = false }
+        for (i in 0 until DATA_CHANNEL_STRIPES) {
+            pc.createDataChannel("$DATA_CHANNEL_PREFIX$i", dataInit)?.let { stripe ->
+                stripeChannels.add(stripe)
+                registerChannelObserver(stripe, isPrimaryControl = false, dcDeferred = dcDeferred)
             }
-        })
+        }
 
-        // Start signaling listener BEFORE sending offer so early answer/ICE signals are never missed
-        suspend fun processServerSignal(event: SignalingEvent) {
+        val acceptingResponses = AtomicBoolean(false)
+        val (token, _) = SignalingClient.activateWebRtcCollector()
+        collectorToken = token
+
+        signalingJob = launchSignalingCollector(dcDeferred, emptyList()) { event ->
             when (event) {
                 is SignalingEvent.AnswerReceived -> {
-                    val answer = SessionDescription(SessionDescription.Type.ANSWER, event.sdp)
-                    awaitSetRemoteDescription(pc, answer)
+                    if (acceptingResponses.get() && !remoteDescriptionSet) {
+                        val answer = SessionDescription(SessionDescription.Type.ANSWER, event.sdp)
+                        awaitSetRemoteDescription(pc, answer)
+                    }
                 }
                 is SignalingEvent.IceCandidateReceived -> {
-                    val ice = IceCandidate(event.sdpMid, event.sdpMLineIndex, event.candidate)
-                    handleRemoteIceCandidate(ice)
+                    if (acceptingResponses.get()) {
+                        val ice = IceCandidate(event.sdpMid, event.sdpMLineIndex, event.candidate)
+                        handleRemoteIceCandidate(ice)
+                    }
                 }
                 is SignalingEvent.PeerDisconnected -> {
                     if (!dcDeferred.isCompleted) {
@@ -252,25 +327,9 @@ class WebRtcTransferTransport(
             }
         }
 
-        val buffered = SignalingClient.drainBufferedWebRtcSignals()
-        signalingJob = scope.launch {
-            try {
-                for (event in buffered) {
-                    processServerSignal(event)
-                }
-                SignalingClient.events.collect { event ->
-                    processServerSignal(event)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                dcDeferred.completeExceptionally(e)
-                failChannel(e)
-            }
-        }
-
         val offerDesc = awaitCreateOffer(pc)
         awaitSetLocalDescription(pc, offerDesc)
+        acceptingResponses.set(true)
         SignalingClient.sendOffer(offerDesc.description)
 
         try {
@@ -285,10 +344,14 @@ class WebRtcTransferTransport(
     }
 
     override suspend fun initAsClient(host: String, port: Int) {
+        if (!SignalingClient.ensureConnected()) {
+            throw IOException("Signaling session is unavailable. Please pair again.")
+        }
         initFactory()
         locallyDisconnected = false
         closedReason = null
         remoteDescriptionSet = false
+        stripeChannels.clear()
         synchronized(iceLock) { pendingRemoteIceCandidates.clear() }
 
         val iceServers = SignalingClient.getTurnCredentials()
@@ -296,7 +359,7 @@ class WebRtcTransferTransport(
         val dcDeferred = CompletableDeferred<Unit>()
 
         val pc = peerConnectionFactory?.createPeerConnection(
-            iceServers,
+            buildRtcConfiguration(iceServers),
             object : SimplePeerConnectionObserver() {
                 override fun onIceCandidate(candidate: IceCandidate?) {
                     candidate?.let {
@@ -316,40 +379,33 @@ class WebRtcTransferTransport(
                 }
 
                 override fun onDataChannel(dc: DataChannel?) {
-                    dc?.let {
-                        dataChannel = it
-                        it.registerObserver(object : DataChannel.Observer {
-                            override fun onBufferedAmountChange(p0: Long) {}
-                            override fun onStateChange() {
-                                when (it.state()) {
-                                    DataChannel.State.OPEN -> dcDeferred.complete(Unit)
-                                    DataChannel.State.CLOSED -> {
-                                        val err = IOException("WebRTC DataChannel closed")
-                                        dcDeferred.completeExceptionally(err)
-                                        failChannel(err)
-                                    }
-                                    else -> {}
-                                }
-                            }
-
-                            override fun onMessage(buffer: DataChannel.Buffer) {
-                                handleDataChannelMessage(buffer)
-                            }
-                        })
+                    dc?.let { channel ->
+                        val isControl = channel.label() == CONTROL_CHANNEL_LABEL || dataChannel == null && !channel.label().startsWith(DATA_CHANNEL_PREFIX)
+                        if (isControl) {
+                            dataChannel = channel
+                        } else {
+                            stripeChannels.add(channel)
+                        }
+                        registerChannelObserver(channel, isPrimaryControl = isControl, dcDeferred = dcDeferred)
                     }
                 }
             }
         ) ?: throw IOException("Failed to create PeerConnection")
         peerConnection = pc
 
-        suspend fun processClientSignal(event: SignalingEvent) {
+        val (token, buffered) = SignalingClient.activateWebRtcCollector()
+        collectorToken = token
+
+        signalingJob = launchSignalingCollector(dcDeferred, buffered) { event ->
             when (event) {
                 is SignalingEvent.OfferReceived -> {
-                    val offer = SessionDescription(SessionDescription.Type.OFFER, event.sdp)
-                    awaitSetRemoteDescription(pc, offer)
-                    val answerDesc = awaitCreateAnswer(pc)
-                    awaitSetLocalDescription(pc, answerDesc)
-                    SignalingClient.sendAnswer(answerDesc.description)
+                    if (!remoteDescriptionSet) {
+                        val offer = SessionDescription(SessionDescription.Type.OFFER, event.sdp)
+                        awaitSetRemoteDescription(pc, offer)
+                        val answerDesc = awaitCreateAnswer(pc)
+                        awaitSetLocalDescription(pc, answerDesc)
+                        SignalingClient.sendAnswer(answerDesc.description)
+                    }
                 }
                 is SignalingEvent.IceCandidateReceived -> {
                     val ice = IceCandidate(event.sdpMid, event.sdpMLineIndex, event.candidate)
@@ -366,24 +422,6 @@ class WebRtcTransferTransport(
             }
         }
 
-        // Process buffered offer & early ICE candidates emitted while user tapped Start Receiving
-        val buffered = SignalingClient.drainBufferedWebRtcSignals()
-        signalingJob = scope.launch {
-            try {
-                for (event in buffered) {
-                    processClientSignal(event)
-                }
-                SignalingClient.events.collect { event ->
-                    processClientSignal(event)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                dcDeferred.completeExceptionally(e)
-                failChannel(e)
-            }
-        }
-
         try {
             withTimeout(CONNECT_TIMEOUT_MS) {
                 dcDeferred.await()
@@ -395,21 +433,51 @@ class WebRtcTransferTransport(
         }
     }
 
-    override suspend fun writeMessage(message: TransferMessage) = writeMutex.withLock {
-        val dc = dataChannel ?: throw IOException("DataChannel not open")
-        if (dc.state() != DataChannel.State.OPEN) {
-            throw IOException("DataChannel is ${dc.state()}")
+    private fun selectTargetChannel(message: TransferMessage): DataChannel? {
+        val control = dataChannel?.takeIf { it.state() == DataChannel.State.OPEN }
+        if (message !is TransferMessage.Chunk) {
+            return control
         }
+        val openStripe = stripeChannels
+            .asSequence()
+            .filter { it.state() == DataChannel.State.OPEN }
+            .minByOrNull { it.bufferedAmount() }
+        return openStripe ?: control
+    }
 
-        val waitStart = System.currentTimeMillis()
-        while (dc.bufferedAmount() > 1024 * 1024) { // 1MB Backpressure limit
-            if (dc.state() != DataChannel.State.OPEN) {
-                throw IOException("DataChannel closed while buffering")
+    override suspend fun writeMessage(message: TransferMessage) = writeMutex.withLock {
+        var targetDc = selectTargetChannel(message)
+            ?: throw IOException("DataChannel not open")
+
+        var currentBuffered = targetDc.bufferedAmount()
+        if (currentBuffered > MAX_BUFFERED_BYTES) {
+            var minBuffered = currentBuffered
+            var lastProgressAt = System.currentTimeMillis()
+            while (currentBuffered > MAX_BUFFERED_BYTES) {
+                if (locallyDisconnected || closedReason != null) {
+                    throw (closedReason ?: IOException("DataChannel closed while buffering"))
+                }
+                if (targetDc.state() != DataChannel.State.OPEN) {
+                    throw IOException("DataChannel closed while buffering")
+                }
+                withTimeoutOrNull(100L) {
+                    bufferChangeSignal.receiveCatching()
+                }
+                val candidate = selectTargetChannel(message) ?: targetDc
+                val nextBuffered = candidate.bufferedAmount()
+                if (candidate !== targetDc && nextBuffered <= MAX_BUFFERED_BYTES) {
+                    targetDc = candidate
+                    currentBuffered = nextBuffered
+                    break
+                }
+                currentBuffered = targetDc.bufferedAmount()
+                if (currentBuffered < minBuffered) {
+                    minBuffered = currentBuffered
+                    lastProgressAt = System.currentTimeMillis()
+                } else if (System.currentTimeMillis() - lastProgressAt > STALL_TIMEOUT_MS) {
+                    throw SocketTimeoutException("Timed out draining WebRTC send buffer")
+                }
             }
-            if (System.currentTimeMillis() - waitStart > READ_TIMEOUT_MS) {
-                throw SocketTimeoutException("Timed out draining WebRTC send buffer")
-            }
-            delay(10)
         }
 
         val bytes = MessageSerializer.serialize(message)
@@ -418,7 +486,7 @@ class WebRtcTransferTransport(
         buffer.flip()
 
         val dcBuffer = DataChannel.Buffer(buffer, true)
-        if (!dc.send(dcBuffer)) {
+        if (!targetDc.send(dcBuffer)) {
             throw IOException("DataChannel send failed")
         }
     }
@@ -427,32 +495,57 @@ class WebRtcTransferTransport(
         if (locallyDisconnected) {
             throw (closedReason ?: IOException("Transfer disconnected"))
         }
-        messageChannel.tryReceive().getOrNull()?.let { return it }
-        closedReason?.let { throw it }
-        return try {
-            withTimeout(READ_TIMEOUT_MS) {
-                messageChannel.receive()
+        val buffered = rawMessageChannel.tryReceive().getOrNull()
+        val bytes = if (buffered != null) {
+            buffered
+        } else {
+            closedReason?.let { throw it }
+            try {
+                withTimeout(READ_TIMEOUT_MS) {
+                    rawMessageChannel.receive()
+                }
+            } catch (_: TimeoutCancellationException) {
+                throw SocketTimeoutException("Timed out waiting for peer message")
+            } catch (e: ClosedReceiveChannelException) {
+                throw (closedReason ?: IOException("Connection closed by peer", e))
             }
-        } catch (_: TimeoutCancellationException) {
-            throw SocketTimeoutException("Timed out waiting for peer message")
-        } catch (e: ClosedReceiveChannelException) {
-            throw (closedReason ?: IOException("Connection closed by peer", e))
+        }
+        return try {
+            MessageSerializer.deserialize(bytes)
+        } catch (e: Exception) {
+            Log.w(tag, "Rejected invalid transfer frame: ${e.message}")
+            val err = IOException("Protocol validation failed: ${e.message}", e)
+            failChannel(err)
+            throw err
         }
     }
 
+    private fun totalOpenBufferedAmount(): Long {
+        var total = 0L
+        dataChannel?.let { if (it.state() == DataChannel.State.OPEN) total += it.bufferedAmount() }
+        for (stripe in stripeChannels) {
+            if (stripe.state() == DataChannel.State.OPEN) total += stripe.bufferedAmount()
+        }
+        return total
+    }
+
     override suspend fun flush() {
-        val dc = dataChannel ?: return
+        val controlOpen = dataChannel?.state() == DataChannel.State.OPEN
+        val anyOpen = controlOpen || stripeChannels.any { it.state() == DataChannel.State.OPEN }
+        if (!anyOpen) return
+
         val deadline = System.currentTimeMillis() + 20_000L
         while (
             !locallyDisconnected &&
             closedReason == null &&
-            dc.state() == DataChannel.State.OPEN &&
-            dc.bufferedAmount() > 0L &&
+            totalOpenBufferedAmount() > 0L &&
             System.currentTimeMillis() < deadline
         ) {
-            delay(25)
+            withTimeoutOrNull(50L) {
+                bufferChangeSignal.receiveCatching()
+            }
         }
-        if (!locallyDisconnected && closedReason == null && dc.state() == DataChannel.State.OPEN) {
+        if (!locallyDisconnected && closedReason == null) {
             delay(25)
         }
     }
@@ -462,7 +555,7 @@ class WebRtcTransferTransport(
         withTimeoutOrNull(timeoutMs) {
             try {
                 while (!locallyDisconnected && closedReason == null) {
-                    messageChannel.receive()
+                    rawMessageChannel.receive()
                 }
             } catch (_: Exception) {
                 // Expected once peer disconnects after receiving CompletionAck
@@ -472,9 +565,14 @@ class WebRtcTransferTransport(
 
     override fun disconnect() {
         locallyDisconnected = true
+        SignalingClient.deactivateWebRtcCollector(collectorToken)
         failChannel(IOException("Transfer disconnected"))
         signalingJob?.cancel()
         scope.cancel()
+        for (stripe in stripeChannels) {
+            try { stripe.close() } catch (_: Exception) {}
+        }
+        stripeChannels.clear()
         try { dataChannel?.close() } catch (_: Exception) {}
         try { peerConnection?.close() } catch (_: Exception) {}
         dataChannel = null

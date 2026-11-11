@@ -82,9 +82,13 @@ class WifiDirectManager(private val context: Context) {
                 }
                 val reasonText = when (reasonCode) {
                     WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct is not supported on this device."
-                    WifiP2pManager.BUSY -> "Wi-Fi Direct is busy. Please try again in a moment."
-                    WifiP2pManager.ERROR -> "Unable to start Wi-Fi Direct. Ensure Wi-Fi and Location are turned ON."
-                    else -> "Wi-Fi Direct failed with code: $reasonCode"
+                    WifiP2pManager.BUSY -> "Wi-Fi Direct is temporarily busy. Please try again in a moment."
+                    WifiP2pManager.ERROR -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        "Unable to start Wi-Fi Direct. Make sure Wi-Fi is turned ON."
+                    } else {
+                        "Unable to start Wi-Fi Direct. Make sure both Wi-Fi and Location are turned ON."
+                    }
+                    else -> "Wi-Fi Direct discovery failed (code $reasonCode)."
                 }
                 _error.value = reasonText
             }
@@ -113,7 +117,12 @@ class WifiDirectManager(private val context: Context) {
             }
 
             override fun onFailure(reason: Int) {
-                _error.value = "Failed to connect. Reason code: $reason"
+                _error.value = when (reason) {
+                    WifiP2pManager.P2P_UNSUPPORTED -> "Peer device does not support Wi-Fi Direct."
+                    WifiP2pManager.BUSY -> "Wi-Fi Direct radio is busy. Disconnect any existing Wi-Fi Direct group and retry."
+                    WifiP2pManager.ERROR -> "Failed to connect via Wi-Fi Direct. Ensure both devices keep Wi-Fi ON and are in range."
+                    else -> "Failed to connect via Wi-Fi Direct (code $reason)."
+                }
             }
         })
     }

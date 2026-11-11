@@ -3,8 +3,10 @@ package com.example.myapplication.data.remote
 import android.util.Log
 import io.socket.client.IO
 import io.socket.client.Socket
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.Dispatchers
 import org.json.JSONObject
 import org.webrtc.PeerConnection
@@ -26,12 +28,20 @@ object SignalingClient {
     var activeSessionId: String? = null
 
     @Volatile
+    private var activePairingToken: String? = null
+
+    @Volatile
+    private var activeIsSender: Boolean = false
+
+    @Volatile
     private var pendingCreatePayload: JSONObject? = null
 
     @Volatile
     private var pendingJoinPayload: JSONObject? = null
 
     private val bufferedWebRtcSignals = mutableListOf<SignalingEvent>()
+    private var webRtcCollectorToken: Long = 0L
+    private var nextCollectorToken: Long = 1L
 
     // replay = 0 prevents old PeerJoined / JoinError events from replaying into fresh screens
     private val _events = kotlinx.coroutines.flow.MutableSharedFlow<SignalingEvent>(
@@ -40,10 +50,18 @@ object SignalingClient {
     )
     val events = _events.asSharedFlow()
 
-    fun drainBufferedWebRtcSignals(): List<SignalingEvent> = synchronized(bufferedWebRtcSignals) {
+    fun activateWebRtcCollector(): Pair<Long, List<SignalingEvent>> = synchronized(bufferedWebRtcSignals) {
+        val token = nextCollectorToken++
+        webRtcCollectorToken = token
         val copy = bufferedWebRtcSignals.toList()
         bufferedWebRtcSignals.clear()
-        copy
+        token to copy
+    }
+
+    fun deactivateWebRtcCollector(token: Long) = synchronized(bufferedWebRtcSignals) {
+        if (webRtcCollectorToken == token) {
+            webRtcCollectorToken = 0L
+        }
     }
 
     fun clearWebRtcSignals() = synchronized(bufferedWebRtcSignals) {
@@ -52,10 +70,16 @@ object SignalingClient {
 
     private fun recordAndEmitWebRtcSignal(event: SignalingEvent) {
         synchronized(bufferedWebRtcSignals) {
-            if (bufferedWebRtcSignals.size >= 120) {
-                bufferedWebRtcSignals.removeAt(0)
+            if (webRtcCollectorToken == 0L) {
+                if (event is SignalingEvent.OfferReceived) {
+                    // Any older signals belong to a previous transfer attempt and must not leak into Retry
+                    bufferedWebRtcSignals.clear()
+                }
+                if (bufferedWebRtcSignals.size >= 120) {
+                    bufferedWebRtcSignals.removeAt(0)
+                }
+                bufferedWebRtcSignals.add(event)
             }
-            bufferedWebRtcSignals.add(event)
         }
         _events.tryEmit(event)
     }
@@ -83,6 +107,7 @@ object SignalingClient {
         }
         var conn: HttpURLConnection? = null
         try {
+            val startedAt = System.currentTimeMillis()
             val url = URL("$base/health")
             conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
@@ -90,13 +115,58 @@ object SignalingClient {
                 readTimeout = 30_000
             }
             val code = conn.responseCode
+            val latencyMs = (System.currentTimeMillis() - startedAt).coerceAtLeast(1L)
             if (code == 200) {
-                Result.success("Server reachable (HTTP 200)")
+                Result.success("Server reachable (HTTP 200 • ${latencyMs} ms)")
             } else {
-                Result.failure(Exception("Server responded with HTTP $code"))
+                Result.failure(Exception("Server responded with HTTP $code. Wait a moment if it is waking up."))
             }
+        } catch (e: java.net.UnknownHostException) {
+            Result.failure(Exception("Host could not be resolved. Check your internet connection or endpoint URL."))
+        } catch (e: java.net.SocketTimeoutException) {
+            Result.failure(Exception("Timed out connecting to server. Free Render instances may take up to 30s to wake up."))
+        } catch (e: java.net.ConnectException) {
+            Result.failure(Exception("Connection refused by server. Verify the server is running and port is open."))
         } catch (e: Exception) {
             Result.failure(Exception(e.message ?: "Unable to reach server"))
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    suspend fun probeTurnSummary(targetUrl: String = serverUrl): Result<String> = withContext(Dispatchers.IO) {
+        val base = targetUrl.trim().trimEnd('/')
+        if (!base.startsWith("http://", ignoreCase = true) &&
+            !base.startsWith("https://", ignoreCase = true)
+        ) {
+            return@withContext Result.failure(IllegalArgumentException("Invalid server URL"))
+        }
+        var conn: HttpURLConnection? = null
+        try {
+            val url = URL("$base/turn-credentials")
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 15_000
+                readTimeout = 15_000
+            }
+            val code = conn.responseCode
+            if (code != 200) {
+                return@withContext Result.failure(Exception("TURN endpoint returned HTTP $code"))
+            }
+            val body = conn.inputStream.bufferedReader().readText()
+            val json = JSONObject(body)
+            val uris = json.optJSONArray("uris")
+            val count = uris?.length() ?: 0
+            if (count == 0) {
+                return@withContext Result.success("No TURN relays configured (STUN only)")
+            }
+            val schemes = (0 until count)
+                .mapNotNull { uris?.optString(it)?.substringBefore(':')?.lowercase()?.takeIf { s -> s.isNotEmpty() } }
+                .distinct()
+                .joinToString("/")
+            Result.success("$count relay endpoint(s) active ($schemes)")
+        } catch (e: Exception) {
+            Result.failure(Exception(e.message ?: "Unable to inspect TURN endpoint"))
         } finally {
             conn?.disconnect()
         }
@@ -117,14 +187,19 @@ object SignalingClient {
             
             socket?.on(Socket.EVENT_CONNECT) {
                 Log.d("SignalingClient", "Connected to signaling server")
+                val pendingCreate = pendingCreatePayload
+                val pendingJoin = pendingJoinPayload
+                val sid = activeSessionId
+                val token = activePairingToken
+                when {
+                    pendingCreate != null -> emitCreateSession(pendingCreate)
+                    pendingJoin != null -> {
+                        pendingJoinPayload = null
+                        emitJoinSession(pendingJoin)
+                    }
+                    sid != null && token != null -> emitRejoinSession(sid, token, activeIsSender)
+                }
                 _events.tryEmit(SignalingEvent.Connected)
-                pendingCreatePayload?.let { payload ->
-                    emitCreateSession(payload)
-                }
-                pendingJoinPayload?.let { payload ->
-                    pendingJoinPayload = null
-                    emitJoinSession(payload)
-                }
             }
             
             socket?.on(Socket.EVENT_CONNECT_ERROR) { args ->
@@ -141,9 +216,14 @@ object SignalingClient {
                 }
             }
             
-            socket?.on("peer-joined") {
+            socket?.on("peer-joined") { args ->
                 pendingCreatePayload = null
                 pendingJoinPayload = null
+                val data = args.firstOrNull() as? JSONObject
+                val token = data?.optString("pairingToken")?.takeIf { it.isNotEmpty() }
+                if (token != null) {
+                    activePairingToken = token
+                }
                 _events.tryEmit(SignalingEvent.PeerJoined)
             }
             
@@ -153,6 +233,10 @@ object SignalingClient {
             
             socket?.on("peer-disconnected") {
                 _events.tryEmit(SignalingEvent.PeerDisconnected)
+            }
+
+            socket?.on("retry-transfer") {
+                _events.tryEmit(SignalingEvent.RetryTransfer)
             }
 
             socket?.on("offer") { args ->
@@ -195,6 +279,8 @@ object SignalingClient {
     fun createSession(sessionId: String, token: String, pin: String) {
         clearWebRtcSignals()
         activeSessionId = sessionId
+        activePairingToken = token
+        activeIsSender = true
         val data = JSONObject().apply {
             put("sessionId", sessionId)
             put("pairingToken", token)
@@ -223,6 +309,8 @@ object SignalingClient {
 
     fun joinSessionWithPin(pin: String) {
         clearWebRtcSignals()
+        activePairingToken = null
+        activeIsSender = false
         val data = JSONObject().apply {
             put("pin", pin)
         }
@@ -236,6 +324,8 @@ object SignalingClient {
 
     fun joinSessionWithQr(sessionId: String, token: String) {
         clearWebRtcSignals()
+        activePairingToken = token
+        activeIsSender = false
         val data = JSONObject().apply {
             put("sessionId", sessionId)
             put("pairingToken", token)
@@ -259,6 +349,57 @@ object SignalingClient {
         })
     }
 
+    private fun emitRejoinSession(
+        sessionId: String,
+        token: String,
+        isSender: Boolean,
+        onDone: ((Boolean) -> Unit)? = null
+    ) {
+        val data = JSONObject().apply {
+            put("sessionId", sessionId)
+            put("pairingToken", token)
+            put("isSender", isSender)
+        }
+        socket?.emit("rejoin-session", data, io.socket.client.Ack { args ->
+            val response = args.firstOrNull() as? JSONObject
+            val ok = response?.optBoolean("success", false) ?: false
+            if (!ok) {
+                Log.w("SignalingClient", "Rejoin session failed: ${response?.optString("error")}")
+            }
+            onDone?.invoke(ok)
+        })
+    }
+
+    suspend fun ensureConnected(timeoutMs: Long = 5_000L): Boolean {
+        val sid = activeSessionId ?: return false
+        if (socket?.connected() == true) return true
+        val token = activePairingToken
+        val connected = CompletableDeferred<Boolean>()
+        connect()
+        val start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            if (socket?.connected() == true) {
+                if (token != null) {
+                    val rejoinResult = CompletableDeferred<Boolean>()
+                    emitRejoinSession(sid, token, activeIsSender) { ok -> rejoinResult.complete(ok) }
+                    withTimeoutOrNull(2_000L) { rejoinResult.await() }
+                }
+                connected.complete(true)
+                break
+            }
+            kotlinx.coroutines.delay(50)
+        }
+        return if (connected.isCompleted) connected.await() else (socket?.connected() == true)
+    }
+
+    fun sendRetryTransfer() {
+        val sid = activeSessionId ?: return
+        val data = JSONObject().apply {
+            put("sessionId", sid)
+        }
+        socket?.emit("retry-transfer", data)
+    }
+
     fun leaveSession(sessionId: String? = activeSessionId) {
         val sid = sessionId ?: return
         if (pendingCreatePayload?.optString("sessionId") == sid) {
@@ -272,6 +413,8 @@ object SignalingClient {
         socket?.emit("leave-session", data)
         if (activeSessionId == sid) {
             activeSessionId = null
+            activePairingToken = null
+            activeIsSender = false
         }
     }
 
@@ -364,9 +507,14 @@ object SignalingClient {
 
     fun disconnect() {
         activeSessionId = null
+        activePairingToken = null
+        activeIsSender = false
         pendingCreatePayload = null
         pendingJoinPayload = null
-        clearWebRtcSignals()
+        synchronized(bufferedWebRtcSignals) {
+            webRtcCollectorToken = 0L
+            bufferedWebRtcSignals.clear()
+        }
         socket?.off()
         socket?.disconnect()
         socket = null
@@ -386,6 +534,7 @@ sealed class SignalingEvent {
     object PeerJoined : SignalingEvent()
     object JoinRejected : SignalingEvent()
     object PeerDisconnected : SignalingEvent()
+    object RetryTransfer : SignalingEvent()
     
     data class OfferReceived(val sdp: String) : SignalingEvent()
     data class AnswerReceived(val sdp: String) : SignalingEvent()

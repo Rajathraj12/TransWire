@@ -24,7 +24,8 @@ object MessageSerializer {
     private val SHA256_REGEX = Regex("^[0-9a-fA-F]{64}$")
 
     fun serialize(message: TransferMessage): ByteArray {
-        val baos = ByteArrayOutputStream()
+        val initialCapacity = if (message is TransferMessage.Chunk) message.length + 128 else 256
+        val baos = ByteArrayOutputStream(initialCapacity)
         val out = DataOutputStream(baos)
         writeMessage(out, message)
         out.flush()

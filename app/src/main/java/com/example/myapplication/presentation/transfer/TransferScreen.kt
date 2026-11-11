@@ -39,11 +39,13 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.myapplication.data.remote.SignalingClient
+import com.example.myapplication.data.remote.SignalingEvent
 import com.example.myapplication.data.storage.FileStorageManager
 import com.example.myapplication.domain.model.TransferProgress
 import com.example.myapplication.domain.model.TransferredFileItem
 import com.example.myapplication.presentation.components.*
 import com.example.myapplication.presentation.theme.*
+import com.example.myapplication.service.TransferSessionCoordinator
 import java.util.concurrent.TimeUnit
 
 @Composable
@@ -68,6 +70,28 @@ fun TransferScreen(
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    LaunchedEffect(isSender, hostIp) {
+        if (hostIp == "0.0.0.0") {
+            SignalingClient.events.collect { event ->
+                val state = viewModel.progress.value
+                val readyForPeerRetry = state.isCompleted &&
+                    state.canRetry &&
+                    !state.isCancelled &&
+                    !TransferSessionCoordinator.isTransferActive()
+                if (!readyForPeerRetry) return@collect
+
+                when {
+                    event is SignalingEvent.RetryTransfer -> {
+                        TransferSessionCoordinator.retryTransfer(context, notifyPeer = false)
+                    }
+                    !isSender && event is SignalingEvent.OfferReceived -> {
+                        TransferSessionCoordinator.retryTransfer(context, notifyPeer = false)
+                    }
+                }
+            }
         }
     }
 

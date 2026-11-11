@@ -36,4 +36,8 @@ class BarcodeAnalyzer(private val onBarcodeScanned: (String) -> Unit) : ImageAna
             imageProxy.close()
         }
     }
+
+    fun close() {
+        runCatching { scanner.close() }
+    }
 }

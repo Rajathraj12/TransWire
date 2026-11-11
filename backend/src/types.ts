@@ -52,3 +52,13 @@ export const iceCandidateSchema = z.object({
 export const leaveSessionSchema = z.object({
   sessionId: sessionIdSchema
 }).strict();
+
+export const rejoinSessionSchema = z.object({
+  sessionId: sessionIdSchema,
+  pairingToken: tokenSchema,
+  isSender: z.boolean()
+}).strict();
+
+export const retryTransferSchema = z.object({
+  sessionId: sessionIdSchema
+}).strict();

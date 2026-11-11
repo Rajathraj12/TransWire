@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.example.myapplication.data.remote.SignalingClient
 import com.example.myapplication.data.transport.TcpTransferTransport
 import com.example.myapplication.data.transport.WebRtcTransferTransport
 import com.example.myapplication.domain.model.SelectedFile
@@ -14,6 +15,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -58,15 +60,38 @@ object TransferSessionCoordinator {
         isSender: Boolean,
         hostIp: String,
         isGroupOwner: Boolean,
-        files: List<SelectedFile>
+        files: List<SelectedFile>,
+        notifyPeerRetry: Boolean = false
     ) {
         val appContext = context.applicationContext
         lastParams = TransferLaunchParams(isSender, hostIp, isGroupOwner, files)
         isCurrentSessionSender = isSender
 
-        activeManager?.cancelTransfer()
-        collectorJob?.cancel()
-        activeJob?.cancel()
+        val prevManager = activeManager
+        val prevCollector = collectorJob
+        val prevJob = activeJob
+        if (prevJob?.isActive == true && prevManager?.progress?.value?.isCompleted == false) {
+            prevManager.cancelTransfer()
+        }
+
+        if (hostIp == "0.0.0.0" && SignalingClient.activeSessionId == null) {
+            prevCollector?.cancel()
+            prevJob?.cancel()
+            activeManager = null
+            activeJob = null
+            _progress.value = TransferProgress(
+                currentFileName = "",
+                fileProgress = 0f,
+                totalBytesTransferred = 0L,
+                totalBytes = files.sumOf { it.size },
+                speedBytesPerSec = 0L,
+                estimatedTimeRemainingMs = 0L,
+                isCompleted = true,
+                canRetry = false,
+                error = "Remote pairing session expired. Please pair devices again."
+            )
+            return
+        }
 
         _progress.value = TransferProgress(
             currentFileName = if (isSender) "Preparing files..." else "Connecting to sender...",
@@ -94,25 +119,38 @@ object TransferSessionCoordinator {
 
         startForegroundServiceSafely(appContext)
 
-        collectorJob = scope.launch {
-            manager.progress.collect { state ->
-                _progress.value = state
-            }
-        }
-
         activeJob = scope.launch {
+            prevCollector?.cancel()
+            if (prevJob != null && prevJob.isActive) {
+                runCatching { prevJob.cancelAndJoin() }
+            }
+
+            if (hostIp == "0.0.0.0") {
+                SignalingClient.ensureConnected()
+                if (notifyPeerRetry) {
+                    SignalingClient.sendRetryTransfer()
+                }
+            }
+
+            collectorJob = scope.launch {
+                manager.progress.collect { state ->
+                    _progress.value = state
+                }
+            }
+
             manager.start(files)
         }
     }
 
-    fun retryTransfer(context: Context) {
+    fun retryTransfer(context: Context, notifyPeer: Boolean = true) {
         val params = lastParams ?: return
         startTransfer(
             context = context,
             isSender = params.isSender,
             hostIp = params.hostIp,
             isGroupOwner = params.isGroupOwner,
-            files = params.files
+            files = params.files,
+            notifyPeerRetry = notifyPeer
         )
     }
 
