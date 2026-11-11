@@ -8,6 +8,7 @@ interface TransferTransport {
     suspend fun writeMessage(message: TransferMessage)
     suspend fun readMessage(): TransferMessage
     suspend fun flush() {}
+    fun pendingBufferedBytes(): Long = 0L
     suspend fun awaitRemoteClose(timeoutMs: Long = 5_000L) {}
     fun disconnect()
 }

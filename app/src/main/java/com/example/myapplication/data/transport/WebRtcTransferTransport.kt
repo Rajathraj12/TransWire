@@ -53,7 +53,7 @@ class WebRtcTransferTransport(
         private const val CONNECT_TIMEOUT_MS = 60_000L
         private const val READ_TIMEOUT_MS = 60_000L
         private const val STALL_TIMEOUT_MS = 60_000L
-        private const val MAX_BUFFERED_BYTES = 4L * 1024L * 1024L
+        private const val MAX_TOTAL_BUFFERED_BYTES = 1536L * 1024L
         private const val CONTROL_CHANNEL_LABEL = "fileTransfer"
         private const val DATA_CHANNEL_PREFIX = "fileTransfer-data-"
         private const val DATA_CHANNEL_STRIPES = 3
@@ -449,11 +449,12 @@ class WebRtcTransferTransport(
         var targetDc = selectTargetChannel(message)
             ?: throw IOException("DataChannel not open")
 
-        var currentBuffered = targetDc.bufferedAmount()
-        if (currentBuffered > MAX_BUFFERED_BYTES) {
-            var minBuffered = currentBuffered
+        val isChunk = message is TransferMessage.Chunk
+        var pendingBytes = if (isChunk) totalOpenBufferedAmount() else targetDc.bufferedAmount()
+        if (pendingBytes > MAX_TOTAL_BUFFERED_BYTES) {
+            var minBuffered = pendingBytes
             var lastProgressAt = System.currentTimeMillis()
-            while (currentBuffered > MAX_BUFFERED_BYTES) {
+            while (pendingBytes > MAX_TOTAL_BUFFERED_BYTES) {
                 if (locallyDisconnected || closedReason != null) {
                     throw (closedReason ?: IOException("DataChannel closed while buffering"))
                 }
@@ -463,21 +464,23 @@ class WebRtcTransferTransport(
                 withTimeoutOrNull(100L) {
                     bufferChangeSignal.receiveCatching()
                 }
-                val candidate = selectTargetChannel(message) ?: targetDc
-                val nextBuffered = candidate.bufferedAmount()
-                if (candidate !== targetDc && nextBuffered <= MAX_BUFFERED_BYTES) {
-                    targetDc = candidate
-                    currentBuffered = nextBuffered
-                    break
+                if (isChunk) {
+                    targetDc = selectTargetChannel(message) ?: targetDc
+                    pendingBytes = totalOpenBufferedAmount()
+                } else {
+                    pendingBytes = targetDc.bufferedAmount()
                 }
-                currentBuffered = targetDc.bufferedAmount()
-                if (currentBuffered < minBuffered) {
-                    minBuffered = currentBuffered
+                if (pendingBytes < minBuffered) {
+                    minBuffered = pendingBytes
                     lastProgressAt = System.currentTimeMillis()
                 } else if (System.currentTimeMillis() - lastProgressAt > STALL_TIMEOUT_MS) {
                     throw SocketTimeoutException("Timed out draining WebRTC send buffer")
                 }
             }
+        }
+
+        if (targetDc.state() != DataChannel.State.OPEN) {
+            throw IOException("DataChannel closed before send")
         }
 
         val bytes = MessageSerializer.serialize(message)
@@ -519,6 +522,8 @@ class WebRtcTransferTransport(
             throw err
         }
     }
+
+    override fun pendingBufferedBytes(): Long = totalOpenBufferedAmount()
 
     private fun totalOpenBufferedAmount(): Long {
         var total = 0L

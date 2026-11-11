@@ -144,7 +144,7 @@ class FileStorageManager(private val context: Context) {
     fun computeFileSha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         FileInputStream(file).use { input ->
-            val buffer = ByteArray(64 * 1024)
+            val buffer = ByteArray(256 * 1024)
             var read: Int
             while (input.read(buffer).also { read = it } != -1) {
                 digest.update(buffer, 0, read)
@@ -164,7 +164,7 @@ class FileStorageManager(private val context: Context) {
                 try {
                     context.contentResolver.openOutputStream(uri)?.use { outputStream ->
                         FileInputStream(tempFile).use { inputStream ->
-                            inputStream.copyTo(outputStream)
+                            inputStream.copyTo(outputStream, bufferSize = 256 * 1024)
                         }
                     } ?: throw IllegalStateException("Could not open MediaStore output stream")
 
@@ -192,7 +192,7 @@ class FileStorageManager(private val context: Context) {
             }
             FileInputStream(tempFile).use { input ->
                 FileOutputStream(targetFile).use { output ->
-                    input.copyTo(output)
+                    input.copyTo(output, bufferSize = 256 * 1024)
                 }
             }
             deleteTempFile(tempFile)

@@ -283,6 +283,7 @@ class TransferManager(
 
             val startTime = System.currentTimeMillis()
             val sessionStartBytes = totalTransferred
+            var lastReportedTotalTransferred = sessionStartBytes
 
             for ((index, fileInfo) in manifestFiles.withIndex()) {
                 if (isCancelled) throw TransferCancelledException()
@@ -304,6 +305,7 @@ class TransferManager(
 
                 val digest = MessageDigest.getInstance("SHA-256")
                 var fileTransferred = tracker.verifiedBytes(fileInfo.size, chunkSize)
+                var lastReportedFileTransferred = fileTransferred
 
                 if (totalChunks > 0) {
                     try {
@@ -331,11 +333,18 @@ class TransferManager(
                                     transport.writeMessage(TransferMessage.Chunk(fileInfo.fileId, chunkIdx, bytesRead, buffer))
                                     fileTransferred += bytesRead
                                     totalTransferred += bytesRead
+                                    val pendingBuffered = transport.pendingBufferedBytes()
+                                    val drainedFile = (fileTransferred - pendingBuffered)
+                                        .coerceIn(lastReportedFileTransferred, fileInfo.size)
+                                    val drainedTotal = (totalTransferred - pendingBuffered)
+                                        .coerceIn(lastReportedTotalTransferred, totalBytes)
+                                    lastReportedFileTransferred = drainedFile
+                                    lastReportedTotalTransferred = drainedTotal
                                     updateProgress(
                                         fileName = fileInfo.name,
-                                        fileTransferred = fileTransferred,
+                                        fileTransferred = drainedFile,
                                         fileTotal = fileInfo.size,
-                                        totalTransferred = totalTransferred,
+                                        totalTransferred = drainedTotal,
                                         totalBytes = totalBytes,
                                         startTime = startTime,
                                         sessionStartBytes = sessionStartBytes
@@ -362,7 +371,52 @@ class TransferManager(
                 lastControlActivityAt.set(System.currentTimeMillis())
             }
 
-            transport.flush()
+            val lastFile = manifestFiles.lastOrNull()
+            fun emitDrainProgress() {
+                if (lastFile == null) return
+                val pendingBuffered = transport.pendingBufferedBytes()
+                val drainedTotal = (totalBytes - pendingBuffered)
+                    .coerceIn(lastReportedTotalTransferred, totalBytes)
+                val drainedFile = (lastFile.size - pendingBuffered)
+                    .coerceIn(0L, lastFile.size)
+                lastReportedTotalTransferred = drainedTotal
+                updateProgress(
+                    fileName = lastFile.name,
+                    fileTransferred = drainedFile,
+                    fileTotal = lastFile.size,
+                    totalTransferred = drainedTotal,
+                    totalBytes = totalBytes,
+                    startTime = startTime,
+                    sessionStartBytes = sessionStartBytes
+                )
+            }
+
+            val flushDone = CompletableDeferred<Unit>()
+            val flushJob = launch {
+                try {
+                    transport.flush()
+                    flushDone.complete(Unit)
+                } catch (e: CancellationException) {
+                    flushDone.cancel(e)
+                    throw e
+                } catch (e: Exception) {
+                    flushDone.completeExceptionally(e)
+                }
+            }
+            try {
+                while (!flushDone.isCompleted) {
+                    if (isCancelled) throw TransferCancelledException()
+                    peerErrorMessage?.let { throw Exception(it) }
+                    emitDrainProgress()
+                    withTimeoutOrNull(150L) {
+                        flushDone.await()
+                    }
+                }
+                flushDone.await()
+            } finally {
+                flushJob.cancel()
+            }
+            emitDrainProgress()
             lastControlActivityAt.set(System.currentTimeMillis())
             while (!allAcksCompleted.isCompleted) {
                 if (isCancelled) throw TransferCancelledException()
@@ -523,10 +577,12 @@ class TransferManager(
             }
 
             val resumeInfos = ArrayList<FileResumeInfo>(sanitizedManifest.size)
+            val fileTransferredBytes = HashMap<String, Long>(sanitizedManifest.size)
             for (fileInfo in sanitizedManifest) {
                 val tempFile = tempFiles[fileInfo.fileId]!!
                 val tracker = trackers[fileInfo.fileId]!!
                 val verifiedBytes = tracker.verifiedBytes(fileInfo.size, DEFAULT_CHUNK_SIZE)
+                fileTransferredBytes[fileInfo.fileId] = verifiedBytes
                 val rangesStr = tracker.toRangeString()
                 val initialStatus = if (tracker.verifiedCount() > 0) "IN_PROGRESS" else "PENDING"
 
@@ -598,14 +654,17 @@ class TransferManager(
                         activeFileId = msg.fileId
                         activeChunkIndex = msg.chunkIndex
 
+                        var currentFileBytes = fileTransferredBytes[msg.fileId] ?: 0L
                         if (!tracker.isVerified(msg.chunkIndex)) {
                             raf.seek(msg.chunkIndex.toLong() * DEFAULT_CHUNK_SIZE)
                             raf.write(msg.payload, 0, msg.length)
                             tracker.markVerified(msg.chunkIndex)
                             totalTransferred += msg.length
+                            currentFileBytes = (currentFileBytes + msg.length).coerceAtMost(fileInfo.size)
+                            fileTransferredBytes[msg.fileId] = currentFileBytes
                         }
 
-                        val fileBytes = tracker.verifiedBytes(fileInfo.size, DEFAULT_CHUNK_SIZE)
+                        val fileBytes = currentFileBytes
                         val countSincePersist = (chunksSincePersist[msg.fileId] ?: 0) + 1
                         chunksSincePersist[msg.fileId] = countSincePersist
                         val now = System.currentTimeMillis()
